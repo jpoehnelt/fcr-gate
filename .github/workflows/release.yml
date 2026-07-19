@@ -106,6 +106,9 @@ jobs:
           persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
 
+      - name: Trust checked out source in build container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install pinned target toolchain
         run: |
           rustup show active-toolchain
