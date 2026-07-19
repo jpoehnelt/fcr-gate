@@ -143,6 +143,51 @@ live mode stores the TID-to-user relationship locally with the matched plate as
 the vehicle description. The LPR event has already opened the gate, so live
 correlation suppresses a redundant RFID unlock on that pass.
 
+### Multi-visit discovery for existing vehicle tags
+
+`RFID_DISCOVERY_MODE=dry-run` or `live` learns existing non-default tags such as a
+readable toll pass without rewriting them. TID is the durable identity when the
+tag reports it; otherwise the service uses `EPC:<hex>` as a lower-confidence
+fallback. The configured factory-default EPC is always excluded. EPC-only
+candidates require at least five matches even when
+`RFID_DISCOVERY_MIN_OCCURRENCES` is lower.
+
+Each period of continuous RFID visibility is one passage. Repeated inventory reads
+and repeated queries of the same UniFi LPR event cannot add votes. A passage is
+credited only when its short matching window contains one distinct successful
+permanent-user plate identity. Unmatched and ambiguous passages remain evidence
+against confidence rather than disappearing. The matching window is anchored to
+the R700 event timestamp, so delayed buffered reads cannot match a current vehicle.
+
+The defaults activate a TID candidate after at least three matching passages on
+two distinct UTC days, at least 80 percent of all retained non-stationary passages
+matching the leading user/plate pair, and fewer than two matches for any competing
+pair. Multiple tags in one vehicle can independently learn the same plate. A tag
+that remains continuously visible beyond `RFID_DISCOVERY_MAX_DWELL_MS` is treated
+as stationary and cannot qualify.
+
+Live learned assignments are renewable 60-day leases. A later successful LPR
+passage for the same user and plate renews the lease; repeated evidence for another
+vehicle or a long-dwell tag suspends it. Dry-run records observations and candidate
+audits but never activates, renews, or suspends an assignment. Existing learned
+tags still undergo the normal live UniFi status, policy, and schedule checks before
+an RFID-only unlock.
+
+Review candidates and revoke a learned assignment from the gateway with:
+
+```bash
+set -a
+. /data/fcr-gate/secrets/gateway.env
+set +a
+/data/fcr-gate/bin/fcr-rfid-encoder discovery-status --limit 100
+/data/fcr-gate/bin/fcr-rfid-encoder revoke-learned TID_OR_EPC_KEY
+/data/fcr-gate/bin/fcr-rfid-encoder reset-learned SUSPENDED_TID_OR_EPC_KEY
+```
+
+Some toll systems use protocols the R700 cannot inventory; those passes will not
+appear as candidates. Raw passage evidence is retained only for
+`RFID_DISCOVERY_EVIDENCE_DAYS`.
+
 With `RFID_GATE_MODE=dry-run` or `live`, a read from an active assignment is not
 itself authorization. The service asks UniFi for the user's current status and all
 direct and group access policies, expands door groups, and evaluates the Entry Gate
@@ -175,9 +220,10 @@ ingress:
 
 Before setting `FCR_GATE_WEB_ENABLED=true`, create a Cloudflare Access application
 for that hostname and restrict its policy to the intended operators. Keep
-`RFID_LPR_CORRELATION_MODE=disabled` and `RFID_GATE_MODE=disabled` while testing
-manual claims and revocations. Test each feature in `dry-run` and review its audit
-records before changing that feature to `live`.
+`RFID_LPR_CORRELATION_MODE=disabled`, `RFID_DISCOVERY_MODE=disabled`, and
+`RFID_GATE_MODE=disabled` while testing manual claims and revocations. Test each
+feature in `dry-run` and review its logs and audit records before changing that
+feature to `live`.
 
 ## Health monitoring
 

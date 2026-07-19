@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -46,6 +47,17 @@ pub struct TagObservation {
     pub access_responses: Vec<TagAccessResponse>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveryObservation {
+    pub tag_key: String,
+    pub identity_kind: &'static str,
+    pub tid: Option<String>,
+    pub epc: String,
+    pub antenna_port: u16,
+    pub peak_rssi_cdbm: i32,
+    pub observed_at_ms: i64,
+}
+
 impl TagObservation {
     pub fn from_reader_event(event: &ReaderEvent) -> Option<Self> {
         if event.event_type != "tagInventory" {
@@ -63,6 +75,47 @@ impl TagObservation {
             antenna_port: tag.antenna_port?,
             peak_rssi_cdbm: tag.peak_rssi_cdbm?,
             access_responses: tag.tag_access_responses.clone(),
+        })
+    }
+}
+
+impl DiscoveryObservation {
+    pub fn from_reader_event(event: &ReaderEvent) -> Option<Self> {
+        if event.event_type != "tagInventory" {
+            return None;
+        }
+        let tag = event.tag_inventory_event.as_ref()?;
+        let epc = tag.epc_hex.as_ref()?.trim().to_ascii_uppercase();
+        if !valid_even_hex(&epc) {
+            return None;
+        }
+        let tid = match tag.tid_hex.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(value) => {
+                let value = value.to_ascii_uppercase();
+                if !valid_even_hex(&value) || value.len() > 128 {
+                    return None;
+                }
+                Some(value)
+            }
+        };
+        let (tag_key, identity_kind) = if let Some(tid) = &tid {
+            (tid.clone(), "tid")
+        } else {
+            (format!("EPC:{epc}"), "epc")
+        };
+        let observed_at_ms = DateTime::parse_from_rfc3339(&event.timestamp)
+            .ok()?
+            .with_timezone(&Utc)
+            .timestamp_millis();
+        Some(Self {
+            tag_key,
+            identity_kind,
+            tid,
+            epc,
+            antenna_port: tag.antenna_port?,
+            peak_rssi_cdbm: tag.peak_rssi_cdbm?,
+            observed_at_ms,
         })
     }
 }
@@ -98,5 +151,45 @@ mod tests {
         let observation = TagObservation::from_reader_event(&event).unwrap();
         assert_eq!(observation.tid, "E28011606000020497CB0065");
         assert_eq!(observation.access_responses.len(), 1);
+    }
+
+    #[test]
+    fn discovery_falls_back_to_a_stable_epc_key_without_tid() {
+        let event: ReaderEvent = serde_json::from_value(serde_json::json!({
+            "eventType": "tagInventory",
+            "timestamp": "2026-07-18T12:00:00.000Z",
+            "tagInventoryEvent": {
+                "epcHex": "11223344556677889900AABB",
+                "antennaPort": 1,
+                "peakRssiCdbm": -4100
+            }
+        }))
+        .unwrap();
+
+        let observation = DiscoveryObservation::from_reader_event(&event).unwrap();
+        assert_eq!(observation.tag_key, "EPC:11223344556677889900AABB");
+        assert_eq!(observation.identity_kind, "epc");
+        assert_eq!(observation.tid, None);
+        assert_eq!(observation.observed_at_ms, 1_784_376_000_000);
+    }
+
+    #[test]
+    fn discovery_prefers_tid_over_epc() {
+        let event: ReaderEvent = serde_json::from_value(serde_json::json!({
+            "eventType": "tagInventory",
+            "timestamp": "2026-07-18T12:00:00.000Z",
+            "tagInventoryEvent": {
+                "epcHex": "11223344556677889900AABB",
+                "tidHex": "e28011606000020497cb0065",
+                "antennaPort": 1,
+                "peakRssiCdbm": -4100
+            }
+        }))
+        .unwrap();
+
+        let observation = DiscoveryObservation::from_reader_event(&event).unwrap();
+        assert_eq!(observation.tag_key, "E28011606000020497CB0065");
+        assert_eq!(observation.identity_kind, "tid");
+        assert_eq!(observation.tid.as_deref(), Some("E28011606000020497CB0065"));
     }
 }

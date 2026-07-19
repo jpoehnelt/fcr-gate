@@ -63,7 +63,8 @@ recurring Visitors so they can pass the Entry Gate.
   the cancelled shells (no API hard-delete) — those need the Access UI.
 - `fcr-gate-admin epc-report` — inspect an Impinj reported-EPC CSV offline.
 - `fcr-rfid-encoder` — long-running R700 encoder, assignment UI, health endpoint,
-  and optional UniFi-authorized Entry Gate trigger.
+  optional UniFi-authorized Entry Gate trigger, and multi-visit discovery of
+  existing non-default vehicle tags.
 
 ## Conventions / gotchas
 
