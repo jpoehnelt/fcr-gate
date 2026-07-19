@@ -1,0 +1,165 @@
+name: Calendar Release
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      release_date:
+        description: Optional release date in YYYY-MM-DD (America/Denver today by default)
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: calendar-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  prepare:
+    name: Prepare calendar tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.plan.outputs.publish_tag }}
+
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Plan the release
+        id: plan
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE_DATE: ${{ inputs.release_date }}
+        run: |
+          set -Eeuo pipefail
+          git fetch --force --tags origin
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$DEFAULT_BRANCH")"
+          test -z "$(git status --porcelain)"
+
+          if [[ -n "$INPUT_RELEASE_DATE" ]]; then
+            tag="$(scripts/release/calver.sh "$INPUT_RELEASE_DATE")"
+          else
+            tag="$(scripts/release/calver.sh)"
+          fi
+
+          previous_tag="$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null || true)"
+          if [[ -n "$previous_tag" ]]; then
+            previous_release_is_draft="$(
+              gh release view "$previous_tag" --repo "$GITHUB_REPOSITORY" \
+                --json isDraft --jq '.isDraft' 2>/dev/null || true
+            )"
+            if [[ "$previous_release_is_draft" != false ]]; then
+              package_version="$(
+                git show "${previous_tag}:Cargo.toml" |
+                  awk -F '"' '/^version = / { print $2; exit }'
+              )"
+              test "v$package_version" = "$previous_tag"
+              echo "Resuming unpublished release $previous_tag"
+              echo "mode=resume" >>"$GITHUB_OUTPUT"
+              echo "publish_tag=$previous_tag" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            package_version="$(git show "${tag}:Cargo.toml" | awk -F '"' '/^version = / { print $2; exit }')"
+            test "v$package_version" = "$tag"
+            release_is_draft="$(
+              gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+                --json isDraft --jq '.isDraft' 2>/dev/null || true
+            )"
+            if [[ "$release_is_draft" == false ]]; then
+              echo "Release $tag is already published; nothing to do"
+              exit 0
+            fi
+            echo "Resuming unpublished release $tag"
+            echo "mode=resume" >>"$GITHUB_OUTPUT"
+            echo "publish_tag=$tag" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$previous_tag" =~ ^v([1-9][0-9]{3})\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            previous_year="${BASH_REMATCH[1]}"
+            previous_month="${BASH_REMATCH[2]}"
+            previous_day="${BASH_REMATCH[3]}"
+            previous_date="$((previous_year * 10000 + previous_month * 100 + previous_day))"
+            current_version="${tag#v}"
+            IFS=. read -r current_year current_month current_day <<<"$current_version"
+            current_date="$((current_year * 10000 + current_month * 100 + current_day))"
+            ((current_date > previous_date)) || {
+              echo "$tag is not later than previous calendar tag $previous_tag" >&2
+              exit 1
+            }
+          fi
+          if [[ -n "$previous_tag" ]] && git diff --quiet "$previous_tag"..HEAD --; then
+            echo "No changes since $previous_tag; nothing to release"
+            exit 0
+          fi
+
+          echo "Preparing $tag"
+          echo "mode=create" >>"$GITHUB_OUTPUT"
+          echo "publish_tag=$tag" >>"$GITHUB_OUTPUT"
+
+      - name: Set the calendar version
+        if: steps.plan.outputs.mode == 'create'
+        env:
+          TAG: ${{ steps.plan.outputs.publish_tag }}
+        run: scripts/release/set-version.sh "$TAG"
+
+      - name: Verify the release commit
+        if: steps.plan.outputs.mode == 'create'
+        run: |
+          set -Eeuo pipefail
+          cargo fmt --check
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --all-targets --all-features --locked
+          find . -type f -name '*.sh' -not -path './target/*' -print0 | xargs -0 shellcheck
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit --deny warnings
+          git diff --check
+          test "$(git diff --name-only | LC_ALL=C sort)" = $'Cargo.lock\nCargo.toml'
+
+      - name: Commit and tag the release
+        if: steps.plan.outputs.mode == 'create'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          TAG: ${{ steps.plan.outputs.publish_tag }}
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock
+          git diff --cached --check
+          git commit -m "chore: release $TAG"
+          git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+          git tag -a "$TAG" -m "FCR Gate $TAG"
+          git push origin "refs/tags/$TAG"
+
+  release:
+    name: Build and publish
+    needs: prepare
+    if: needs.prepare.outputs.tag != ''
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}

@@ -101,3 +101,25 @@ jobs:
         run: |
           find . -type f -name '*.sh' -not -path './target/*' -print0 | xargs -0 -n1 bash -n
           bash install.sh --help >/dev/null
+
+      - name: Test calendar release helpers
+        run: |
+          set -Eeuo pipefail
+          test "$(scripts/release/calver.sh 2026-07-19)" = v2026.7.19
+          test "$(scripts/release/calver.sh 2028-02-29)" = v2028.2.29
+          if scripts/release/calver.sh 2026-02-29 >/dev/null 2>&1; then
+            echo "accepted an invalid calendar date" >&2
+            exit 1
+          fi
+
+          fixture="$(mktemp -d)"
+          trap 'rm -rf -- "$fixture"' EXIT
+          git archive HEAD | tar -x -C "$fixture"
+          scripts/release/set-version.sh v2999.12.31 "$fixture"
+          test "$(
+            awk -F '"' '/^version = / { print $2; exit }' "$fixture/Cargo.toml"
+          )" = 2999.12.31
+          (
+            cd "$fixture"
+            cargo metadata --locked --no-deps --format-version 1 >/dev/null
+          )

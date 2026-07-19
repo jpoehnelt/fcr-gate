@@ -67,7 +67,8 @@ recurring Visitors so they can pass the Entry Gate.
 
 ## Conventions / gotchas
 
-- All application code is Rust; Bash is used only for gateway installation hooks.
+- All application code is Rust; Bash is limited to gateway installation and
+  release automation.
 - Date math uses Unix seconds. The Rust CLI writes `enrolled_visitors.json` after
   completing a live enrollment run.
 - **Live access-control system.** Creating/deleting visitors changes who can enter
@@ -79,3 +80,14 @@ recurring Visitors so they can pass the Entry Gate.
 
 Use `fcr-gate-admin cleanup-visitors --dry-run`, review the result, then use
 `--apply`. It soft-cancels matching visitors and strips their plate associations.
+
+## Release invariants
+
+- Automated releases use `vYYYY.M.D` without zero padding. Only
+  `scripts/release/set-version.sh` should update the package and lockfile versions.
+- A release tag must identify the exact checked-out commit, match the Cargo package
+  version, and be derived from the default branch.
+- Calendar preparation may change only `Cargo.toml` and `Cargo.lock`; the reusable
+  Release workflow independently rebuilds, verifies, attests, and publishes assets.
+- Published release bytes are immutable. A rerun may repair a draft or verify an
+  identical published release, but must never replace published assets.

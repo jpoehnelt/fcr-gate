@@ -13,8 +13,12 @@ repository="$2"
 dist_dir="$3"
 
 [[ "${GITHUB_ACTIONS:-}" == true ]] || die "publishing is only allowed in GitHub Actions"
-[[ "${GITHUB_REF_TYPE:-}" == tag && "${GITHUB_REF_NAME:-}" == "$tag" ]] ||
-  die "workflow ref does not match release tag $tag"
+[[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]] ||
+  die "invalid release tag: $tag"
+tag_commit="$(git rev-list -n 1 "refs/tags/$tag" 2>/dev/null)" ||
+  die "release tag does not exist locally: $tag"
+[[ "$(git rev-parse HEAD)" == "$tag_commit" ]] ||
+  die "checked-out commit does not match release tag $tag"
 [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
   die "invalid GitHub repository: $repository"
 [[ -d "$dist_dir" ]] || die "distribution directory not found: $dist_dir"
