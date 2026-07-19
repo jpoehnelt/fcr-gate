@@ -467,7 +467,7 @@ const APP_JS: &str = r#"const state={tags:[],selectedTag:null,selectedUser:null,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::GateMode;
+    use crate::config::{GateMode, LprCorrelationMode};
     use tempfile::tempdir;
 
     fn state() -> AppState {
@@ -514,6 +514,9 @@ mod tests {
             health_stale_after: Duration::from_secs(120),
             web_bind: "127.0.0.1:8080".parse().unwrap(),
             claim_window: Duration::from_secs(60),
+            lpr_correlation_mode: LprCorrelationMode::Disabled,
+            lpr_correlation_window: Duration::from_secs(10),
+            lpr_correlation_poll: Duration::from_secs(2),
             gate_mode: GateMode::Disabled,
             gate_unlock_cooldown: Duration::from_secs(10),
             unifi_base_url: Some("https://unifi.test:12445".into()),

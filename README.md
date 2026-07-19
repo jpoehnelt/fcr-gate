@@ -102,8 +102,9 @@ set +a
 target/release/fcr-rfid-encoder run
 ```
 
-RFID writes, the operator UI, and gate unlocks have independent safety controls.
-See [Gateway services](docs/gateway-services.md) for commissioning, tag ownership,
+RFID writes, automatic LPR ownership correlation, the operator UI, and gate
+unlocks have independent safety controls. See
+[Gateway services](docs/gateway-services.md) for commissioning, tag ownership,
 Cloudflare Access, health monitoring, and failure handling.
 
 ### Install on the UniFi gateway

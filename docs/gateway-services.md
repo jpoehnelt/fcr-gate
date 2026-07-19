@@ -124,6 +124,25 @@ reserved in the database for operational loss handling). Transfers require an
 explicit revoke followed by a new claim. Claims and revocations record the
 Cloudflare-authenticated operator email in `audit_log`.
 
+`RFID_LPR_CORRELATION_MODE=dry-run` or `live` can correlate a newly encoded tag
+with an existing permanent UniFi user automatically. The service considers only
+one completed tag that has never been assigned, then reads a short window of
+Entry Gate `LICENSEPLATE` logs. A match requires exactly one plate and one distinct
+successful `ACCESS` user/plate pair whose actor type is `user`, plus an active user
+and an Entry Gate access policy. Repeated reads of that same pair are harmless.
+Visitor events, blocked-only reads, another plate, another unassigned tag,
+truncated logs, or malformed data do not create an assignment.
+
+Ambiguity advances a per-TID cutoff in SQLite, so an old event cannot become a
+match merely because other activity ages out of the window or the service
+restarts. The tag remains unassigned and eligible indefinitely; if it returns days
+later, a new clean plate event inside `RFID_LPR_CORRELATION_WINDOW_MS` can create
+the relationship. Revoked or lost tags are never reassigned automatically.
+Dry-run audits the candidate and advances the cutoff without changing ownership;
+live mode stores the TID-to-user relationship locally with the matched plate as
+the vehicle description. The LPR event has already opened the gate, so live
+correlation suppresses a redundant RFID unlock on that pass.
+
 With `RFID_GATE_MODE=dry-run` or `live`, a read from an active assignment is not
 itself authorization. The service asks UniFi for the user's current status and all
 direct and group access policies, expands door groups, and evaluates the Entry Gate
@@ -156,9 +175,9 @@ ingress:
 
 Before setting `FCR_GATE_WEB_ENABLED=true`, create a Cloudflare Access application
 for that hostname and restrict its policy to the intended operators. Keep
-`RFID_GATE_MODE=disabled` while testing claims and revocations, then use `dry-run`
-to verify assigned, revoked, allowed, and out-of-schedule tags. Change it to `live`
-only after reviewing those decisions.
+`RFID_LPR_CORRELATION_MODE=disabled` and `RFID_GATE_MODE=disabled` while testing
+manual claims and revocations. Test each feature in `dry-run` and review its audit
+records before changing that feature to `live`.
 
 ## Health monitoring
 

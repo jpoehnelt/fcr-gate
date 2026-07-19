@@ -4,14 +4,15 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use fcr_rfid_encoder::{
-    config::{Config, GateMode, normalize_hex, state_db_path},
+    config::{Config, GateMode, LprCorrelationMode, normalize_hex, state_db_path},
     engine::{Action, Engine},
     impinj::ImpinjClient,
     model::{ReaderEvent, TagObservation},
     store::{Store, now_ms},
-    unifi::{AuthorizationDecision, UnifiClient},
+    unifi::{AuthorizationDecision, LprCorrelation, UnifiClient},
     web,
 };
 use tokio::sync::mpsc;
@@ -46,6 +47,7 @@ enum Command {
 struct GateRuntime {
     unifi: Option<UnifiClient>,
     last_attempts: HashMap<String, Instant>,
+    lpr_last_attempts: HashMap<String, Instant>,
 }
 
 #[tokio::main]
@@ -76,9 +78,10 @@ async fn run() -> Result<()> {
     let reader = ImpinjClient::new(&config)?;
     reader.ensure_profile(&config).await?;
     let reader_health = reader.health();
-    let unifi = (config.web_enabled || config.gate_mode.enabled())
-        .then(|| UnifiClient::new(&config))
-        .transpose()?;
+    let unifi =
+        (config.web_enabled || config.gate_mode.enabled() || config.lpr_correlation_mode.enabled())
+            .then(|| UnifiClient::new(&config))
+            .transpose()?;
 
     let (sender, mut receiver) = mpsc::channel::<ReaderEvent>(4096);
     let stream_task = tokio::spawn(reader.clone().stream_events(sender));
@@ -98,6 +101,7 @@ async fn run() -> Result<()> {
     let mut gate = GateRuntime {
         unifi,
         last_attempts: HashMap::new(),
+        lpr_last_attempts: HashMap::new(),
     };
     let mut timeout_check = tokio::time::interval(Duration::from_secs(1));
     timeout_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -111,6 +115,7 @@ async fn run() -> Result<()> {
         confirm_reads = config.confirm_reads,
         operator_ui = config.web_enabled,
         health_endpoint = config.health_enabled,
+        lpr_correlation_mode = config.lpr_correlation_mode.as_str(),
         gate_mode = config.gate_mode.as_str(),
         "RFID encoder service ready"
     );
@@ -206,6 +211,7 @@ async fn handle_event(
             &observation.epc,
             observation.peak_rssi_cdbm,
         )?;
+        maybe_correlate_lpr(config, gate, store, &observation).await?;
         maybe_unlock_gate(config, gate, store, &observation).await?;
     }
     let action = engine.observe(&observation, assignment.as_ref(), Instant::now());
@@ -279,11 +285,156 @@ async fn handle_event(
             store.record_seen(&tid, &epc, observation.peak_rssi_cdbm)?;
             engine.clear_in_flight(&tid);
             info!(%tid, %epc, "encoding completed and confirmed by normal inventory");
+            maybe_correlate_lpr(config, gate, store, &observation).await?;
         }
         Action::Conflict { tid, observed_epc } => {
             store.mark_conflict(&tid, &observed_epc)?;
             engine.clear_in_flight(&tid);
             error!(%tid, %observed_epc, "TID reported an EPC different from its durable assignment");
+        }
+    }
+    Ok(())
+}
+
+async fn maybe_correlate_lpr(
+    config: &Config,
+    gate: &mut GateRuntime,
+    store: &mut Store,
+    observation: &TagObservation,
+) -> Result<()> {
+    if config.lpr_correlation_mode == LprCorrelationMode::Disabled
+        || store.get_active_owner(&observation.tid)?.is_some()
+    {
+        return Ok(());
+    }
+
+    let attempt_time = Instant::now();
+    if gate
+        .lpr_last_attempts
+        .get(&observation.tid)
+        .is_some_and(|last| attempt_time.duration_since(*last) < config.lpr_correlation_poll)
+    {
+        return Ok(());
+    }
+    gate.lpr_last_attempts
+        .insert(observation.tid.clone(), attempt_time);
+
+    let now = Utc::now();
+    let now_ms = now.timestamp_millis();
+    let recent_tids = store.recent_never_assigned_tids(config.lpr_correlation_window)?;
+    if recent_tids.len() != 1 || recent_tids[0] != observation.tid {
+        if recent_tids.iter().any(|tid| tid == &observation.tid) && recent_tids.len() > 1 {
+            for tid in &recent_tids {
+                store.advance_lpr_correlation_not_before(tid, now_ms)?;
+            }
+            warn!(
+                tid = %observation.tid,
+                tag_count = recent_tids.len(),
+                "LPR correlation deferred because multiple unassigned RFID tags are present; a new plate event will be required"
+            );
+        }
+        return Ok(());
+    }
+
+    let window_ms = i64::try_from(config.lpr_correlation_window.as_millis()).unwrap_or(i64::MAX);
+    let window_start_ms = now_ms.saturating_sub(window_ms);
+    let since_ms = store
+        .lpr_correlation_not_before_ms(&observation.tid)?
+        .map_or(window_start_ms, |cutoff| cutoff.max(window_start_ms));
+    let since = DateTime::<Utc>::from_timestamp_millis(since_ms)
+        .context("LPR correlation cutoff is outside the supported date range")?;
+    if since >= now {
+        return Ok(());
+    }
+    let unifi = gate
+        .unifi
+        .as_ref()
+        .context("LPR correlation requires a UniFi Access client")?;
+
+    match unifi.find_lpr_user_match(since, now).await? {
+        LprCorrelation::NoMatch => {}
+        LprCorrelation::Ambiguous { reason } => {
+            store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
+            let detail = serde_json::json!({"reason": reason}).to_string();
+            store.record_lpr_correlation_audit(
+                &observation.tid,
+                &observation.epc,
+                "lpr-correlation-ambiguous",
+                &detail,
+            )?;
+            warn!(
+                tid = %observation.tid,
+                %reason,
+                "LPR correlation was ambiguous; a new plate event will be required"
+            );
+        }
+        LprCorrelation::Match(candidate) => {
+            let user = match unifi.validate_claim_user(&candidate.user_id).await {
+                Ok(user) => user,
+                Err(error) => {
+                    store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
+                    let detail = serde_json::json!({
+                        "reason": error.to_string(),
+                        "plate": candidate.plate,
+                        "unifi_user_id": candidate.user_id,
+                    })
+                    .to_string();
+                    store.record_lpr_correlation_audit(
+                        &observation.tid,
+                        &observation.epc,
+                        "lpr-correlation-ambiguous",
+                        &detail,
+                    )?;
+                    warn!(
+                        tid = %observation.tid,
+                        %error,
+                        "LPR user failed the ownership eligibility check; a new plate event will be required"
+                    );
+                    return Ok(());
+                }
+            };
+            let detail = serde_json::json!({
+                "plate": candidate.plate,
+                "unifi_user_id": user.id,
+                "unifi_user_name": user.display_name(),
+                "lpr_timestamp": candidate.timestamp.to_rfc3339(),
+            })
+            .to_string();
+            if config.lpr_correlation_mode == LprCorrelationMode::DryRun {
+                store.record_lpr_correlation_audit(
+                    &observation.tid,
+                    &observation.epc,
+                    "lpr-correlation-dry-run",
+                    &detail,
+                )?;
+                store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
+                info!(
+                    tid = %observation.tid,
+                    plate = %candidate.plate,
+                    user = %user.display_name(),
+                    "dry run: LPR event would assign RFID tag to existing UniFi user"
+                );
+                return Ok(());
+            }
+
+            let vehicle = format!("License plate {}", candidate.plate);
+            store.claim_tag(
+                &observation.tid,
+                &user.id,
+                &user.display_name(),
+                Some(&vehicle),
+                config.claim_window,
+            )?;
+            // The successful LPR event already opened the gate. Avoid a redundant
+            // remote unlock on the same pass when RFID gate mode is also enabled.
+            gate.last_attempts
+                .insert(observation.tid.clone(), Instant::now());
+            info!(
+                tid = %observation.tid,
+                plate = %candidate.plate,
+                user = %user.display_name(),
+                "assigned RFID tag to the existing UniFi user matched by Entry Gate LPR"
+            );
         }
     }
     Ok(())
@@ -453,7 +604,7 @@ mod tests {
     use std::{
         path::PathBuf,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
@@ -461,7 +612,7 @@ mod tests {
     use axum::{
         Json, Router,
         extract::State,
-        routing::{get, put},
+        routing::{get, post, put},
     };
     use serde_json::{Value, json};
     use tempfile::tempdir;
@@ -481,7 +632,9 @@ mod tests {
         policy_reads: AtomicUsize,
         group_reads: AtomicUsize,
         schedule_reads: AtomicUsize,
+        lpr_reads: AtomicUsize,
         unlocks: AtomicUsize,
+        lpr_hits: Mutex<Vec<Value>>,
     }
 
     async fn mock_user(State(counts): State<Arc<MockCounts>>) -> Json<Value> {
@@ -549,6 +702,21 @@ mod tests {
         Json(json!({"code": "SUCCESS", "msg": "success", "data": "success"}))
     }
 
+    async fn mock_logs(
+        State(counts): State<Arc<MockCounts>>,
+        Json(payload): Json<Value>,
+    ) -> Json<Value> {
+        assert_eq!(payload["topic"], "door_openings");
+        counts.lpr_reads.fetch_add(1, Ordering::SeqCst);
+        let hits = counts.lpr_hits.lock().unwrap().clone();
+        Json(json!({
+            "code": "SUCCESS",
+            "msg": "success",
+            "pagination": {"total": hits.len()},
+            "data": {"hits": hits}
+        }))
+    }
+
     async fn mock_unifi(user_active: bool) -> (String, Arc<MockCounts>, JoinHandle<()>) {
         let counts = Arc::new(MockCounts::default());
         counts.user_active.store(user_active, Ordering::SeqCst);
@@ -563,6 +731,7 @@ mod tests {
                 "/api/v1/developer/access_policies/schedules/{id}",
                 get(mock_schedule),
             )
+            .route("/api/v1/developer/system/logs", post(mock_logs))
             .route("/api/v1/developer/doors/{id}/unlock", put(mock_unlock))
             .with_state(counts.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -601,6 +770,9 @@ mod tests {
             health_stale_after: Duration::from_secs(120),
             web_bind: "127.0.0.1:8080".parse().unwrap(),
             claim_window: Duration::from_secs(60),
+            lpr_correlation_mode: LprCorrelationMode::Disabled,
+            lpr_correlation_window: Duration::from_secs(10),
+            lpr_correlation_poll: Duration::from_secs(2),
             gate_mode,
             gate_unlock_cooldown: Duration::from_secs(30),
             unifi_base_url: Some(unifi_base_url),
@@ -612,21 +784,26 @@ mod tests {
     }
 
     fn assigned_tag(store: &mut Store) -> TagObservation {
+        let observation = unassigned_tag(store);
+        store
+            .claim_tag(
+                &observation.tid,
+                USER_ID,
+                "Example User",
+                None,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        observation
+    }
+
+    fn unassigned_tag(store: &mut Store) -> TagObservation {
         let encoding = store.allocate("E2801111", "FCA7000100000000").unwrap();
         store
             .mark_completed(&encoding.tid, &encoding.assigned_epc)
             .unwrap();
         store
             .record_seen(&encoding.tid, &encoding.assigned_epc, -4200)
-            .unwrap();
-        store
-            .claim_tag(
-                &encoding.tid,
-                USER_ID,
-                "Example User",
-                None,
-                Duration::from_secs(60),
-            )
             .unwrap();
         TagObservation {
             tid: encoding.tid,
@@ -635,6 +812,25 @@ mod tests {
             peak_rssi_cdbm: -4200,
             access_responses: Vec::new(),
         }
+    }
+
+    fn lpr_hit(timestamp: DateTime<Utc>, plate: &str, result: &str) -> Value {
+        json!({
+            "@timestamp": timestamp.to_rfc3339(),
+            "_source": {
+                "actor": if result == "ACCESS" {
+                    json!({"type": "user", "id": USER_ID})
+                } else {
+                    json!({"type": "", "id": ""})
+                },
+                "authentication": {
+                    "credential_provider": "LICENSEPLATE",
+                    "issuer": plate
+                },
+                "event": {"result": result},
+                "target": [{"type": "door", "id": DOOR_ID}]
+            }
+        })
     }
 
     #[tokio::test]
@@ -648,6 +844,7 @@ mod tests {
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&dry_run).unwrap()),
             last_attempts: HashMap::new(),
+            lpr_last_attempts: HashMap::new(),
         };
 
         maybe_unlock_gate(&dry_run, &mut gate, &mut store, &observation)
@@ -667,6 +864,7 @@ mod tests {
         let mut live_gate = GateRuntime {
             unifi: Some(UnifiClient::new(&live).unwrap()),
             last_attempts: HashMap::new(),
+            lpr_last_attempts: HashMap::new(),
         };
         maybe_unlock_gate(&live, &mut live_gate, &mut store, &observation)
             .await
@@ -689,6 +887,7 @@ mod tests {
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
             last_attempts: HashMap::new(),
+            lpr_last_attempts: HashMap::new(),
         };
 
         maybe_unlock_gate(&config, &mut gate, &mut store, &observation)
@@ -705,6 +904,70 @@ mod tests {
             event.detail.as_deref(),
             Some("UniFi user status is DEACTIVATED")
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_new_clean_lpr_event_resolves_durable_first_pass_ambiguity() {
+        let (base_url, counts, server) = mock_unifi(true).await;
+        let directory = tempdir().unwrap();
+        let db = directory.path().join("state.sqlite3");
+        let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
+        config.lpr_correlation_mode = LprCorrelationMode::Live;
+        config.lpr_correlation_poll = Duration::from_millis(1);
+        let mut store = Store::open(&db, "gate-auto").unwrap();
+        let observation = unassigned_tag(&mut store);
+        let first_event = Utc::now() - chrono::Duration::seconds(1);
+        *counts.lpr_hits.lock().unwrap() = vec![
+            lpr_hit(first_event, "ABC123", "ACCESS"),
+            lpr_hit(first_event, "XYZ789", "BLOCKED"),
+        ];
+        let mut gate = GateRuntime {
+            unifi: Some(UnifiClient::new(&config).unwrap()),
+            last_attempts: HashMap::new(),
+            lpr_last_attempts: HashMap::new(),
+        };
+
+        maybe_correlate_lpr(&config, &mut gate, &mut store, &observation)
+            .await
+            .unwrap();
+        assert!(store.get_active_owner(&observation.tid).unwrap().is_none());
+        assert!(
+            store
+                .lpr_correlation_not_before_ms(&observation.tid)
+                .unwrap()
+                .is_some()
+        );
+
+        // Reopen the database to prove the ambiguity cutoff survives a service
+        // restart. Elapsed wall-clock time does not affect future eligibility.
+        drop(store);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let clean_event = Utc::now();
+        counts
+            .lpr_hits
+            .lock()
+            .unwrap()
+            .push(lpr_hit(clean_event, "ABC123", "ACCESS"));
+        let mut store = Store::open(&db, "gate-auto").unwrap();
+        let mut restarted_gate = GateRuntime {
+            unifi: Some(UnifiClient::new(&config).unwrap()),
+            last_attempts: HashMap::new(),
+            lpr_last_attempts: HashMap::new(),
+        };
+
+        maybe_correlate_lpr(&config, &mut restarted_gate, &mut store, &observation)
+            .await
+            .unwrap();
+
+        let owner = store.get_active_owner(&observation.tid).unwrap().unwrap();
+        assert_eq!(owner.unifi_user_id, USER_ID);
+        assert_eq!(
+            owner.vehicle_description.as_deref(),
+            Some("License plate ABC123")
+        );
+        assert_eq!(counts.lpr_reads.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.unlocks.load(Ordering::SeqCst), 0);
         server.abort();
     }
 }

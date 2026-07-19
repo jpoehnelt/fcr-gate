@@ -128,6 +128,11 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS tag_observations_last_seen
                  ON tag_observations(last_seen_ms DESC);
+             CREATE TABLE IF NOT EXISTS lpr_correlation_state (
+                 tid TEXT PRIMARY KEY REFERENCES encodings(tid) ON DELETE CASCADE,
+                 not_before_ms INTEGER NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS gate_events (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  timestamp TEXT NOT NULL,
@@ -233,6 +238,80 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Return recently observed, completed tags that have never had an owner.
+    /// Revoked and lost tags are deliberately excluded from automatic assignment.
+    pub fn recent_never_assigned_tids(&self, window: Duration) -> Result<Vec<String>> {
+        let cutoff = now_ms().saturating_sub(duration_ms(window));
+        let mut statement = self.connection.prepare(
+            "SELECT e.tid
+             FROM encodings e
+             JOIN tag_observations obs ON obs.tid = e.tid
+             LEFT JOIN tag_ownership own ON own.tid = e.tid
+             WHERE e.status = 'completed'
+               AND obs.last_seen_ms >= ?1
+               AND own.tid IS NULL
+             ORDER BY obs.last_seen_ms DESC, e.sequence DESC",
+        )?;
+        let rows = statement.query_map([cutoff], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn lpr_correlation_not_before_ms(&self, tid: &str) -> Result<Option<i64>> {
+        self.connection
+            .query_row(
+                "SELECT not_before_ms FROM lpr_correlation_state WHERE tid = ?1",
+                [tid],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn advance_lpr_correlation_not_before(
+        &mut self,
+        tid: &str,
+        not_before_ms: i64,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO lpr_correlation_state (tid, not_before_ms, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(tid) DO UPDATE SET
+                 not_before_ms = MAX(lpr_correlation_state.not_before_ms, excluded.not_before_ms),
+                 updated_at = excluded.updated_at",
+            params![tid, not_before_ms, timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_lpr_correlation_audit(
+        &mut self,
+        tid: &str,
+        epc: &str,
+        kind: &str,
+        detail: &str,
+    ) -> Result<()> {
+        if !matches!(
+            kind,
+            "lpr-correlation-dry-run" | "lpr-correlation-ambiguous"
+        ) {
+            bail!("invalid LPR correlation audit kind {kind}");
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        audit_tx(
+            &transaction,
+            &self.actor,
+            kind,
+            Some(tid),
+            Some(epc),
+            Some(detail),
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn list_tags(&self, limit: usize) -> Result<Vec<TagRecord>> {
@@ -995,6 +1074,82 @@ mod tests {
                 ("operator@test".into(), "tag-revoked".into()),
                 ("operator@test".into(), "tag-assigned".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn automatic_correlation_only_considers_recent_never_assigned_tags() {
+        let directory = tempdir().unwrap();
+        let mut store = Store::open(&directory.path().join("state.sqlite3"), "test").unwrap();
+
+        let eligible = store.allocate("E2801111", "FCA7000100000000").unwrap();
+        store
+            .mark_completed(&eligible.tid, &eligible.assigned_epc)
+            .unwrap();
+        store
+            .record_seen(&eligible.tid, &eligible.assigned_epc, -4200)
+            .unwrap();
+
+        let revoked = store.allocate("E2802222", "FCA7000100000000").unwrap();
+        store
+            .mark_completed(&revoked.tid, &revoked.assigned_epc)
+            .unwrap();
+        store
+            .record_seen(&revoked.tid, &revoked.assigned_epc, -4200)
+            .unwrap();
+        store
+            .claim_tag(
+                &revoked.tid,
+                "17d2f099-99df-429b-becb-1399a6937e5a",
+                "Example User",
+                None,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        store.revoke_tag(&revoked.tid).unwrap();
+
+        let stale = store.allocate("E2803333", "FCA7000100000000").unwrap();
+        store
+            .mark_completed(&stale.tid, &stale.assigned_epc)
+            .unwrap();
+        store
+            .record_seen(&stale.tid, &stale.assigned_epc, -4200)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE tag_observations SET last_seen_ms = ?1 WHERE tid = ?2",
+                params![now_ms() - 60_000, stale.tid],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .recent_never_assigned_tids(Duration::from_secs(10))
+                .unwrap(),
+            vec![eligible.tid]
+        );
+    }
+
+    #[test]
+    fn ambiguity_cutoff_is_durable_and_only_moves_forward() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let mut store = Store::open(&path, "test").unwrap();
+        let encoding = store.allocate("E2801111", "FCA7000100000000").unwrap();
+
+        store
+            .advance_lpr_correlation_not_before(&encoding.tid, 1_000)
+            .unwrap();
+        store
+            .advance_lpr_correlation_not_before(&encoding.tid, 500)
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(&path, "test").unwrap();
+        assert_eq!(
+            store.lpr_correlation_not_before_ms(&encoding.tid).unwrap(),
+            Some(1_000)
         );
     }
 

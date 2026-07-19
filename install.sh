@@ -240,6 +240,7 @@ Installed $binary_version and $admin_version under $INSTALL_ROOT.
 
 Safety defaults on a first install:
   RFID_WRITES_ENABLED=false
+  RFID_LPR_CORRELATION_MODE=disabled
   RFID_GATE_MODE=disabled
   FCR_GATE_WEB_ENABLED=false
 
