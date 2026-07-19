@@ -1,0 +1,26 @@
+# Secrets — NEVER commit the UniFi API token
+.env
+.env.*
+!.env.example
+
+# License-plate PII and visitor records (contain plate numbers + visitor IDs)
+*.csv
+enrolled_visitors.json
+/tmp/plates*.json
+plates*.json
+license_plates*.json
+
+# Rust build output and local RFID encoder state
+target/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Claude local settings
+.claude/settings.local.json

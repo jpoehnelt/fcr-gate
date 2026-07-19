@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust:
+    name: Rust quality and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets --all-features --locked
+
+      - name: Smoke-test command interfaces
+        run: |
+          cargo run --locked --bin fcr-rfid-encoder -- --help >/dev/null
+          cargo run --locked --bin fcr-gate-admin -- --help >/dev/null
+          cargo run --locked --bin fcr-gate-admin -- extract-plates --help >/dev/null
+          cargo run --locked --bin fcr-gate-admin -- enroll-plates --help >/dev/null
+          cargo run --locked --bin fcr-gate-admin -- cleanup-visitors --help >/dev/null
+          cargo run --locked --bin fcr-gate-admin -- epc-report --help >/dev/null
+
+  msrv:
+    name: Rust 1.85 minimum version
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Check minimum-version build
+        run: cargo +1.85.0 check --all-targets --all-features --locked
+
+  repository-files:
+    name: Workflows, shell, and release scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Lint GitHub Actions workflows
+        uses: docker://rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        with:
+          args: -color -shellcheck=
+
+      - name: Lint Markdown documentation
+        uses: DavidAnson/markdownlint-cli2-action@6bf21b07787794f89a243495939cd651942aeabe # v24.1.0
+        with:
+          globs: |
+            **/*.md
+            #target/**
+
+      - name: Lint shell scripts
+        run: find . -type f -name '*.sh' -not -path './target/*' -print0 | xargs -0 shellcheck
+
+      - name: Check shell syntax and installer interface
+        run: |
+          find . -type f -name '*.sh' -not -path './target/*' -print0 | xargs -0 -n1 bash -n
+          bash install.sh --help >/dev/null

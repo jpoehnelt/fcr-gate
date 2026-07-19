@@ -1,0 +1,19 @@
+[Unit]
+Description=FCR Gate R700 RFID encoder
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/data/fcr-gate
+EnvironmentFile=/data/fcr-gate/secrets/gateway.env
+ExecStart=/data/fcr-gate/bin/fcr-rfid-encoder run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

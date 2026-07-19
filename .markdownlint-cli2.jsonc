@@ -1,0 +1,6 @@
+{
+  "config": {
+    // Prose is wrapped manually; URLs, tables, and shell commands may be longer.
+    "MD013": false
+  }
+}
