@@ -18,6 +18,27 @@ pub enum GateMode {
     Live,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LprCorrelationMode {
+    Disabled,
+    DryRun,
+    Live,
+}
+
+impl LprCorrelationMode {
+    pub fn enabled(self) -> bool {
+        self != Self::Disabled
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::DryRun => "dry-run",
+            Self::Live => "live",
+        }
+    }
+}
+
 impl GateMode {
     pub fn enabled(self) -> bool {
         self != Self::Disabled
@@ -60,6 +81,9 @@ pub struct Config {
     pub health_stale_after: Duration,
     pub web_bind: SocketAddr,
     pub claim_window: Duration,
+    pub lpr_correlation_mode: LprCorrelationMode,
+    pub lpr_correlation_window: Duration,
+    pub lpr_correlation_poll: Duration,
     pub gate_mode: GateMode,
     pub gate_unlock_cooldown: Duration,
     pub unifi_base_url: Option<String>,
@@ -108,8 +132,18 @@ impl Config {
         let health_enabled = boolean("FCR_GATE_HEALTH_ENABLED", true)?;
         let gate_mode =
             parse_gate_mode(&env::var("RFID_GATE_MODE").unwrap_or_else(|_| "disabled".into()))?;
+        let lpr_correlation_mode = parse_lpr_correlation_mode(
+            &env::var("RFID_LPR_CORRELATION_MODE").unwrap_or_else(|_| "disabled".into()),
+        )?;
+        let lpr_correlation_window =
+            Duration::from_millis(positive_number("RFID_LPR_CORRELATION_WINDOW_MS", 10_000)?);
+        let lpr_correlation_poll =
+            Duration::from_millis(positive_number("RFID_LPR_CORRELATION_POLL_MS", 2_000)?);
+        if lpr_correlation_poll > lpr_correlation_window {
+            bail!("RFID_LPR_CORRELATION_POLL_MS must not exceed RFID_LPR_CORRELATION_WINDOW_MS");
+        }
         let web_bind = web_bind()?;
-        let unifi_needed = web_enabled || gate_mode.enabled();
+        let unifi_needed = web_enabled || gate_mode.enabled() || lpr_correlation_mode.enabled();
         let unifi_base_url = unifi_needed
             .then(|| {
                 normalize_url(
@@ -126,7 +160,7 @@ impl Config {
         };
         if unifi_needed && unifi_api_key.is_none() {
             bail!(
-                "UNIFI_API_KEY_FILE or UNIFI_API_KEY is required for the operator UI or gate unlock"
+                "UNIFI_API_KEY_FILE or UNIFI_API_KEY is required for the operator UI, LPR correlation, or gate unlock"
             );
         }
         let unifi_verify_tls = boolean("UNIFI_TLS_VERIFY", false)?;
@@ -173,6 +207,9 @@ impl Config {
             )?),
             web_bind,
             claim_window: Duration::from_millis(positive_number("RFID_CLAIM_WINDOW_MS", 60_000)?),
+            lpr_correlation_mode,
+            lpr_correlation_window,
+            lpr_correlation_poll,
             gate_mode,
             gate_unlock_cooldown: Duration::from_millis(positive_number(
                 "RFID_GATE_UNLOCK_COOLDOWN_MS",
@@ -193,6 +230,15 @@ fn parse_gate_mode(value: &str) -> Result<GateMode> {
         "dry-run" | "dry_run" | "dryrun" => Ok(GateMode::DryRun),
         "live" => Ok(GateMode::Live),
         _ => bail!("RFID_GATE_MODE must be disabled, dry-run, or live"),
+    }
+}
+
+fn parse_lpr_correlation_mode(value: &str) -> Result<LprCorrelationMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "disabled" | "off" => Ok(LprCorrelationMode::Disabled),
+        "dry-run" | "dry_run" | "dryrun" => Ok(LprCorrelationMode::DryRun),
+        "live" => Ok(LprCorrelationMode::Live),
+        _ => bail!("RFID_LPR_CORRELATION_MODE must be disabled, dry-run, or live"),
     }
 }
 
@@ -396,5 +442,22 @@ mod tests {
         assert_eq!(parse_gate_mode("dry-run").unwrap(), GateMode::DryRun);
         assert_eq!(parse_gate_mode("live").unwrap(), GateMode::Live);
         assert!(parse_gate_mode("true").is_err());
+    }
+
+    #[test]
+    fn lpr_correlation_mode_has_an_explicit_dry_run() {
+        assert_eq!(
+            parse_lpr_correlation_mode("disabled").unwrap(),
+            LprCorrelationMode::Disabled
+        );
+        assert_eq!(
+            parse_lpr_correlation_mode("dry-run").unwrap(),
+            LprCorrelationMode::DryRun
+        );
+        assert_eq!(
+            parse_lpr_correlation_mode("live").unwrap(),
+            LprCorrelationMode::Live
+        );
+        assert!(parse_lpr_correlation_mode("true").is_err());
     }
 }

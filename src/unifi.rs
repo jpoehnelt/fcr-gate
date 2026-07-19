@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fs, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Local, NaiveTime, Timelike, Utc, Weekday};
@@ -11,6 +15,7 @@ use crate::config::Config;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const USERS_PER_PAGE: usize = 100;
 const MAX_USER_PAGES: usize = 100;
+const SYSTEM_LOGS_PER_PAGE: usize = 200;
 
 #[derive(Clone)]
 pub struct UnifiClient {
@@ -64,6 +69,20 @@ pub enum AuthorizationDecision {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LprUserMatch {
+    pub user_id: String,
+    pub plate: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LprCorrelation {
+    NoMatch,
+    Match(LprUserMatch),
+    Ambiguous { reason: String },
+}
+
 #[derive(Debug, Deserialize)]
 struct Envelope<T> {
     code: String,
@@ -77,6 +96,62 @@ struct Envelope<T> {
 #[derive(Debug, Deserialize)]
 struct Pagination {
     total: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemLogData {
+    #[serde(default)]
+    hits: Vec<SystemLogHit>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SystemLogHit {
+    #[serde(rename = "@timestamp")]
+    timestamp: String,
+    #[serde(rename = "_source")]
+    source: SystemLogSource,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct SystemLogSource {
+    #[serde(default)]
+    actor: Option<SystemLogActor>,
+    #[serde(default)]
+    authentication: Option<SystemLogAuthentication>,
+    #[serde(default)]
+    event: Option<SystemLogEvent>,
+    #[serde(default)]
+    target: Vec<SystemLogTarget>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SystemLogActor {
+    #[serde(default)]
+    id: String,
+    #[serde(rename = "type", default)]
+    kind: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SystemLogAuthentication {
+    #[serde(default)]
+    credential_provider: String,
+    #[serde(default)]
+    issuer: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SystemLogEvent {
+    #[serde(default)]
+    result: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SystemLogTarget {
+    #[serde(default)]
+    id: String,
+    #[serde(rename = "type", default)]
+    kind: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -196,6 +271,40 @@ impl UnifiClient {
         users.sort_by_key(UnifiUser::display_name);
         users.truncate(200);
         Ok(users)
+    }
+
+    pub async fn find_lpr_user_match(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<LprCorrelation> {
+        if until <= since {
+            return Ok(LprCorrelation::NoMatch);
+        }
+        let response: Envelope<SystemLogData> = self
+            .get_envelope(
+                self.http
+                    .post(self.url("/system/logs"))
+                    .query(&[("page_num", 1_usize), ("page_size", SYSTEM_LOGS_PER_PAGE)])
+                    .json(&json!({
+                        "topic": "door_openings",
+                        "since": since.timestamp(),
+                        "until": until.timestamp(),
+                    })),
+                "fetch recent UniFi Entry Gate plate events",
+            )
+            .await?;
+        let truncated = response.pagination.as_ref().map_or_else(
+            || response.data.hits.len() >= SYSTEM_LOGS_PER_PAGE,
+            |pagination| pagination.total > response.data.hits.len(),
+        );
+        correlate_lpr_hits(
+            &response.data.hits,
+            &self.entry_gate_door_id,
+            since,
+            until,
+            truncated,
+        )
     }
 
     pub async fn validate_claim_user(&self, user_id: &str) -> Result<UnifiUser> {
@@ -389,6 +498,130 @@ where
     Ok(envelope)
 }
 
+fn correlate_lpr_hits(
+    hits: &[SystemLogHit],
+    entry_gate_door_id: &str,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    truncated: bool,
+) -> Result<LprCorrelation> {
+    if truncated {
+        return Ok(LprCorrelation::Ambiguous {
+            reason: "UniFi returned more plate events than fit in one page".into(),
+        });
+    }
+
+    let mut plates = BTreeSet::new();
+    let mut user_pairs = BTreeSet::new();
+    let mut matches = Vec::new();
+    let mut access_without_one_user = false;
+
+    for hit in hits {
+        let Some(authentication) = &hit.source.authentication else {
+            continue;
+        };
+        if !authentication
+            .credential_provider
+            .eq_ignore_ascii_case("LICENSEPLATE")
+        {
+            continue;
+        }
+        if hit.source.target.is_empty() {
+            return Ok(LprCorrelation::Ambiguous {
+                reason: "a license-plate event omitted its target door".into(),
+            });
+        }
+        if !hit.source.target.iter().any(|target| {
+            target.kind.eq_ignore_ascii_case("door") && target.id == entry_gate_door_id
+        }) {
+            continue;
+        }
+        let timestamp = match parse_datetime(&hit.timestamp) {
+            Ok(timestamp) => timestamp,
+            Err(_) => {
+                return Ok(LprCorrelation::Ambiguous {
+                    reason: "an Entry Gate plate event had an invalid timestamp".into(),
+                });
+            }
+        };
+        // The lower bound is exclusive so an ambiguity cutoff cannot be reused.
+        if timestamp <= since || timestamp > until {
+            continue;
+        }
+        let plate = authentication.issuer.trim().to_ascii_uppercase();
+        if plate.is_empty() {
+            return Ok(LprCorrelation::Ambiguous {
+                reason: "an Entry Gate plate event omitted its plate".into(),
+            });
+        }
+        plates.insert(plate.clone());
+
+        let Some(event) = &hit.source.event else {
+            return Ok(LprCorrelation::Ambiguous {
+                reason: "an Entry Gate plate event omitted its access result".into(),
+            });
+        };
+        if event.result.trim().is_empty() {
+            return Ok(LprCorrelation::Ambiguous {
+                reason: "an Entry Gate plate event omitted its access result".into(),
+            });
+        }
+        let is_access = event.result.eq_ignore_ascii_case("ACCESS");
+        if !is_access {
+            continue;
+        }
+        let Some(actor) = &hit.source.actor else {
+            access_without_one_user = true;
+            continue;
+        };
+        if !actor.kind.eq_ignore_ascii_case("user")
+            || actor.id.trim().is_empty()
+            || validate_uuid(actor.id.trim(), "UniFi LPR actor ID").is_err()
+        {
+            access_without_one_user = true;
+            continue;
+        }
+        let user_id = actor.id.trim().to_ascii_lowercase();
+        user_pairs.insert((user_id.clone(), plate.clone()));
+        matches.push(LprUserMatch {
+            user_id,
+            plate,
+            timestamp,
+        });
+    }
+
+    if plates.len() > 1 {
+        return Ok(LprCorrelation::Ambiguous {
+            reason: format!(
+                "{} different license plates were observed at the Entry Gate",
+                plates.len()
+            ),
+        });
+    }
+    if access_without_one_user {
+        return Ok(LprCorrelation::Ambiguous {
+            reason: "an Entry Gate access event did not identify one permanent UniFi user".into(),
+        });
+    }
+    if user_pairs.len() > 1 {
+        return Ok(LprCorrelation::Ambiguous {
+            reason: format!(
+                "{} different user/plate pairs received Entry Gate access",
+                user_pairs.len()
+            ),
+        });
+    }
+    let Some((user_id, plate)) = user_pairs.into_iter().next() else {
+        return Ok(LprCorrelation::NoMatch);
+    };
+    let matched = matches
+        .into_iter()
+        .filter(|candidate| candidate.user_id == user_id && candidate.plate == plate)
+        .max_by_key(|candidate| candidate.timestamp)
+        .context("matched UniFi LPR pair had no source event")?;
+    Ok(LprCorrelation::Match(matched))
+}
+
 fn schedule_allows(
     schedule: &Schedule,
     now_local: DateTime<Local>,
@@ -513,6 +746,7 @@ fn validate_uuid(value: &str, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use chrono::{Local, TimeZone, Utc};
+    use serde_json::json;
 
     use super::*;
 
@@ -521,6 +755,188 @@ mod tests {
             .with_ymd_and_hms(year, month, day, hour, minute, 0)
             .single()
             .unwrap()
+    }
+
+    fn lpr_hit(
+        timestamp: &str,
+        plate: &str,
+        result: &str,
+        actor: Option<(&str, &str)>,
+        door_id: &str,
+    ) -> SystemLogHit {
+        let actor = actor.map(|(kind, id)| json!({"type": kind, "id": id}));
+        serde_json::from_value(json!({
+            "@timestamp": timestamp,
+            "_source": {
+                "actor": actor,
+                "authentication": {
+                    "credential_provider": "LICENSEPLATE",
+                    "issuer": plate
+                },
+                "event": {"result": result},
+                "target": [{"type": "door", "id": "ignored"}, {"type": "door", "id": door_id}]
+            }
+        }))
+        .unwrap()
+    }
+
+    fn lpr_window() -> (DateTime<Utc>, DateTime<Utc>) {
+        (
+            Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 19, 12, 1, 0).unwrap(),
+        )
+    }
+
+    #[test]
+    fn repeated_plate_access_for_one_user_is_one_match() {
+        let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let user = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let hits = vec![
+            lpr_hit(
+                "2026-07-19T12:00:10Z",
+                "ABC123",
+                "ACCESS",
+                Some(("user", user)),
+                door,
+            ),
+            lpr_hit(
+                "2026-07-19T12:00:11Z",
+                "abc123",
+                "ACCESS",
+                Some(("user", user)),
+                door,
+            ),
+        ];
+        let (since, until) = lpr_window();
+
+        assert_eq!(
+            correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
+            LprCorrelation::Match(LprUserMatch {
+                user_id: user.into(),
+                plate: "ABC123".into(),
+                timestamp: Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 11).unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn different_plates_make_the_window_ambiguous_even_if_one_was_blocked() {
+        let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let user = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let hits = vec![
+            lpr_hit(
+                "2026-07-19T12:00:10Z",
+                "ABC123",
+                "ACCESS",
+                Some(("user", user)),
+                door,
+            ),
+            lpr_hit("2026-07-19T12:00:11Z", "XYZ789", "BLOCKED", None, door),
+        ];
+        let (since, until) = lpr_window();
+
+        assert!(matches!(
+            correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
+            LprCorrelation::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
+    fn visitor_access_is_not_treated_as_a_permanent_user_match() {
+        let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let hits = vec![lpr_hit(
+            "2026-07-19T12:00:10Z",
+            "ABC123",
+            "ACCESS",
+            Some(("visitor", "17d2f099-99df-429b-becb-1399a6937e5a")),
+            door,
+        )];
+        let (since, until) = lpr_window();
+
+        assert!(matches!(
+            correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
+            LprCorrelation::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
+    fn two_users_for_the_same_plate_are_ambiguous() {
+        let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let first = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let second = "27d2f099-99df-429b-becb-1399a6937e5b";
+        let hits = vec![
+            lpr_hit(
+                "2026-07-19T12:00:10Z",
+                "ABC123",
+                "ACCESS",
+                Some(("user", first)),
+                door,
+            ),
+            lpr_hit(
+                "2026-07-19T12:00:11Z",
+                "ABC123",
+                "ACCESS",
+                Some(("user", second)),
+                door,
+            ),
+        ];
+        let (since, until) = lpr_window();
+
+        assert!(matches!(
+            correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
+            LprCorrelation::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_entry_gate_plate_event_is_ambiguous() {
+        let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let user = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let hits = vec![lpr_hit(
+            "not-a-time",
+            "ABC123",
+            "ACCESS",
+            Some(("user", user)),
+            door,
+        )];
+        let (since, until) = lpr_window();
+
+        assert!(matches!(
+            correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
+            LprCorrelation::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
+    fn blocked_or_wrong_door_events_do_not_match() {
+        let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let other = "2b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let user = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let hits = vec![
+            lpr_hit("2026-07-19T12:00:10Z", "ABC123", "BLOCKED", None, door),
+            lpr_hit(
+                "2026-07-19T12:00:11Z",
+                "ABC123",
+                "ACCESS",
+                Some(("user", user)),
+                other,
+            ),
+        ];
+        let (since, until) = lpr_window();
+
+        assert_eq!(
+            correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
+            LprCorrelation::NoMatch
+        );
+    }
+
+    #[test]
+    fn truncated_log_window_fails_closed_as_ambiguous() {
+        let (since, until) = lpr_window();
+        assert!(matches!(
+            correlate_lpr_hits(&[], "door", since, until, true).unwrap(),
+            LprCorrelation::Ambiguous { .. }
+        ));
     }
 
     #[test]
