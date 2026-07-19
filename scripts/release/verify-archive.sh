@@ -76,7 +76,7 @@ done
 if [[ "$(uname -m)" == x86_64 && "$target" == x86_64-unknown-linux-musl ]]; then
   [[ "$("$unpack_dir/fcr-rfid-encoder" --version)" == "fcr-rfid-encoder ${tag#v}" ]] ||
     die "encoder binary version does not match $tag"
-  [[ "$("$unpack_dir/fcr-gate-admin" --version)" == "fcr-gate-admin ${tag#v}" ]] ||
+  [[ "$("$unpack_dir/fcr-gate-admin" --version)" == "fcr-rfid-encoder ${tag#v}" ]] ||
     die "admin binary version does not match $tag"
 fi
 
