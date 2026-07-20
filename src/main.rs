@@ -224,22 +224,23 @@ async fn handle_event(
     gate: &mut GateRuntime,
     event: ReaderEvent,
 ) -> Result<()> {
-    if let Some(discovery) = DiscoveryObservation::from_reader_event(&event)
-        && discovery.antenna_port == config.antenna_port
-        && discovery.peak_rssi_cdbm >= config.discovery_min_rssi_cdbm
-        && discovery.epc != config.default_epc
-    {
-        let already_encoded = if let Some(tid) = &discovery.tid {
-            store.get_by_tid(tid)?.is_some()
-        } else {
-            store.has_encoding_epc(&discovery.epc)?
-        };
-        if !already_encoded {
-            if config.discovery_mode.enabled() {
-                maybe_learn_discovered_tag(config, gate, store, &discovery).await?;
+    if let Some(discovery) = DiscoveryObservation::from_reader_event(&event) {
+        if discovery.antenna_port == config.antenna_port
+            && discovery.peak_rssi_cdbm >= config.discovery_min_rssi_cdbm
+            && discovery.epc != config.default_epc
+        {
+            let already_encoded = if let Some(tid) = &discovery.tid {
+                store.get_by_tid(tid)?.is_some()
+            } else {
+                store.has_encoding_epc(&discovery.epc)?
+            };
+            if !already_encoded {
+                if config.discovery_mode.enabled() {
+                    maybe_learn_discovered_tag(config, gate, store, &discovery).await?;
+                }
+                maybe_unlock_gate_identity(config, gate, store, &discovery.tag_key, &discovery.epc)
+                    .await?;
             }
-            maybe_unlock_gate_identity(config, gate, store, &discovery.tag_key, &discovery.epc)
-                .await?;
         }
     }
 
@@ -403,17 +404,21 @@ async fn maybe_learn_discovered_tag(
         return Ok(());
     }
     let poll_ms = i64::try_from(config.discovery_poll.as_millis()).unwrap_or(i64::MAX);
-    let correlation = if let Some(cached) = &gate.discovery_lpr_cache
-        && attempt_time.duration_since(cached.fetched_at) < config.discovery_poll
-        && observation.observed_at_ms.abs_diff(cached.observed_at_ms)
-            <= u64::try_from(poll_ms).unwrap_or(u64::MAX)
-        && match &cached.correlation {
+    let cached_correlation = gate.discovery_lpr_cache.as_ref().and_then(|cached| {
+        let timestamp_matches = match &cached.correlation {
             LprCorrelation::Match(candidate) => {
                 candidate.timestamp > since && candidate.timestamp <= until
             }
             LprCorrelation::NoMatch | LprCorrelation::Ambiguous { .. } => true,
-        } {
-        cached.correlation.clone()
+        };
+        (attempt_time.duration_since(cached.fetched_at) < config.discovery_poll
+            && observation.observed_at_ms.abs_diff(cached.observed_at_ms)
+                <= u64::try_from(poll_ms).unwrap_or(u64::MAX)
+            && timestamp_matches)
+            .then(|| cached.correlation.clone())
+    });
+    let correlation = if let Some(correlation) = cached_correlation {
+        correlation
     } else {
         let correlation = gate
             .unifi
