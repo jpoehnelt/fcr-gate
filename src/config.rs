@@ -84,6 +84,18 @@ pub struct Config {
     pub lpr_correlation_mode: LprCorrelationMode,
     pub lpr_correlation_window: Duration,
     pub lpr_correlation_poll: Duration,
+    pub discovery_mode: LprCorrelationMode,
+    pub discovery_match_window: Duration,
+    pub discovery_poll: Duration,
+    pub discovery_passage_gap: Duration,
+    pub discovery_max_dwell: Duration,
+    pub discovery_min_rssi_cdbm: i32,
+    pub discovery_min_occurrences: u32,
+    pub discovery_min_days: u32,
+    pub discovery_min_confidence_percent: u8,
+    pub discovery_conflict_occurrences: u32,
+    pub discovery_evidence_retention: Duration,
+    pub discovery_lease: Duration,
     pub gate_mode: GateMode,
     pub gate_unlock_cooldown: Duration,
     pub unifi_base_url: Option<String>,
@@ -142,8 +154,33 @@ impl Config {
         if lpr_correlation_poll > lpr_correlation_window {
             bail!("RFID_LPR_CORRELATION_POLL_MS must not exceed RFID_LPR_CORRELATION_WINDOW_MS");
         }
+        let discovery_mode = parse_discovery_mode(
+            &env::var("RFID_DISCOVERY_MODE").unwrap_or_else(|_| "disabled".into()),
+        )?;
+        let discovery_match_window =
+            Duration::from_millis(positive_number("RFID_DISCOVERY_MATCH_WINDOW_MS", 10_000)?);
+        let discovery_poll =
+            Duration::from_millis(positive_number("RFID_DISCOVERY_POLL_MS", 2_000)?);
+        if discovery_poll > discovery_match_window {
+            bail!("RFID_DISCOVERY_POLL_MS must not exceed RFID_DISCOVERY_MATCH_WINDOW_MS");
+        }
+        let discovery_passage_gap =
+            Duration::from_millis(positive_number("RFID_DISCOVERY_PASSAGE_GAP_MS", 30_000)?);
+        let discovery_max_dwell =
+            Duration::from_millis(positive_number("RFID_DISCOVERY_MAX_DWELL_MS", 120_000)?);
+        if discovery_max_dwell <= discovery_passage_gap {
+            bail!("RFID_DISCOVERY_MAX_DWELL_MS must exceed RFID_DISCOVERY_PASSAGE_GAP_MS");
+        }
+        let discovery_min_confidence_percent =
+            positive_number("RFID_DISCOVERY_MIN_CONFIDENCE_PERCENT", 80_u8)?;
+        if discovery_min_confidence_percent > 100 {
+            bail!("RFID_DISCOVERY_MIN_CONFIDENCE_PERCENT must not exceed 100");
+        }
         let web_bind = web_bind()?;
-        let unifi_needed = web_enabled || gate_mode.enabled() || lpr_correlation_mode.enabled();
+        let unifi_needed = web_enabled
+            || gate_mode.enabled()
+            || lpr_correlation_mode.enabled()
+            || discovery_mode.enabled();
         let unifi_base_url = unifi_needed
             .then(|| {
                 normalize_url(
@@ -160,7 +197,7 @@ impl Config {
         };
         if unifi_needed && unifi_api_key.is_none() {
             bail!(
-                "UNIFI_API_KEY_FILE or UNIFI_API_KEY is required for the operator UI, LPR correlation, or gate unlock"
+                "UNIFI_API_KEY_FILE or UNIFI_API_KEY is required for the operator UI, LPR correlation, RFID discovery, or gate unlock"
             );
         }
         let unifi_verify_tls = boolean("UNIFI_TLS_VERIFY", false)?;
@@ -210,6 +247,21 @@ impl Config {
             lpr_correlation_mode,
             lpr_correlation_window,
             lpr_correlation_poll,
+            discovery_mode,
+            discovery_match_window,
+            discovery_poll,
+            discovery_passage_gap,
+            discovery_max_dwell,
+            discovery_min_rssi_cdbm: number("RFID_DISCOVERY_MIN_RSSI_CDBM", -6000)?,
+            discovery_min_occurrences: positive_number("RFID_DISCOVERY_MIN_OCCURRENCES", 3)?,
+            discovery_min_days: positive_number("RFID_DISCOVERY_MIN_DAYS", 2)?,
+            discovery_min_confidence_percent,
+            discovery_conflict_occurrences: positive_number(
+                "RFID_DISCOVERY_CONFLICT_OCCURRENCES",
+                2,
+            )?,
+            discovery_evidence_retention: days_duration("RFID_DISCOVERY_EVIDENCE_DAYS", 60)?,
+            discovery_lease: days_duration("RFID_DISCOVERY_LEASE_DAYS", 60)?,
             gate_mode,
             gate_unlock_cooldown: Duration::from_millis(positive_number(
                 "RFID_GATE_UNLOCK_COOLDOWN_MS",
@@ -239,6 +291,15 @@ fn parse_lpr_correlation_mode(value: &str) -> Result<LprCorrelationMode> {
         "dry-run" | "dry_run" | "dryrun" => Ok(LprCorrelationMode::DryRun),
         "live" => Ok(LprCorrelationMode::Live),
         _ => bail!("RFID_LPR_CORRELATION_MODE must be disabled, dry-run, or live"),
+    }
+}
+
+fn parse_discovery_mode(value: &str) -> Result<LprCorrelationMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "disabled" | "off" => Ok(LprCorrelationMode::Disabled),
+        "dry-run" | "dry_run" | "dryrun" => Ok(LprCorrelationMode::DryRun),
+        "live" => Ok(LprCorrelationMode::Live),
+        _ => bail!("RFID_DISCOVERY_MODE must be disabled, dry-run, or live"),
     }
 }
 
@@ -395,6 +456,14 @@ where
     Ok(value)
 }
 
+fn days_duration(name: &str, default: u64) -> Result<Duration> {
+    let days = positive_number(name, default)?;
+    let seconds = days
+        .checked_mul(24 * 60 * 60)
+        .with_context(|| format!("{name} is too large"))?;
+    Ok(Duration::from_secs(seconds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +528,22 @@ mod tests {
             LprCorrelationMode::Live
         );
         assert!(parse_lpr_correlation_mode("true").is_err());
+    }
+
+    #[test]
+    fn discovery_mode_has_an_explicit_dry_run() {
+        assert_eq!(
+            parse_discovery_mode("disabled").unwrap(),
+            LprCorrelationMode::Disabled
+        );
+        assert_eq!(
+            parse_discovery_mode("dry-run").unwrap(),
+            LprCorrelationMode::DryRun
+        );
+        assert_eq!(
+            parse_discovery_mode("live").unwrap(),
+            LprCorrelationMode::Live
+        );
+        assert!(parse_discovery_mode("true").is_err());
     }
 }

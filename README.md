@@ -89,7 +89,9 @@ This operation is offline and never changes the reader.
 `fcr-rfid-encoder` inventories the configured R700 antenna and recognizes the
 factory EPC `300833B2DDD9014000000000`. It requires repeated, strong reads of one
 exact TID before allocating and writing a durable 96-bit EPC. Every write is read
-back and then confirmed through ordinary inventory.
+back and then confirmed through ordinary inventory. An independent multi-visit
+discovery mode can also learn an existing, non-default vehicle tag from repeated
+successful LPR passages without rewriting the tag.
 
 Start in observation-only mode:
 
