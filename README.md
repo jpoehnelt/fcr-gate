@@ -166,10 +166,18 @@ RFID_STATE_DB=/data/fcr-gate/rfid-encoder.sqlite3 \
 RFID_STATE_DB=/data/fcr-gate/rfid-encoder.sqlite3 \
   /data/fcr-gate/bin/fcr-rfid-encoder gate-events --limit 50
 curl --fail-with-body http://127.0.0.1:8080/healthz
+# Optional after enabling metrics; use the configured listener values:
+. /data/fcr-gate/secrets/gateway.env
+curl --fail-with-body "http://${FCR_GATE_METRICS_BIND}:${FCR_GATE_METRICS_PORT}/metrics"
 ```
 
 The health response contains service, reader, and database status only. It never
-includes tags, users, vehicles, or credentials.
+includes tags, users, vehicles, or credentials. Prometheus metrics are disabled
+by default; enable their separate tailnet listener with
+`FCR_GATE_METRICS_ENABLED=true` after restricting the gateway target with
+Tailscale ACLs. Configure Prometheus with `FCR_GATE_METRICS_BIND` and
+`FCR_GATE_METRICS_PORT` from the gateway environment; the endpoint does not expose
+EPCs, TIDs, plates, users, or credentials.
 
 ## Development checks
 

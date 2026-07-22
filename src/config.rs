@@ -80,6 +80,8 @@ pub struct Config {
     pub health_enabled: bool,
     pub health_stale_after: Duration,
     pub web_bind: SocketAddr,
+    pub metrics_enabled: bool,
+    pub metrics_bind: SocketAddr,
     pub claim_window: Duration,
     pub lpr_correlation_mode: LprCorrelationMode,
     pub lpr_correlation_window: Duration,
@@ -142,6 +144,7 @@ impl Config {
         )?;
         let web_enabled = boolean("FCR_GATE_WEB_ENABLED", false)?;
         let health_enabled = boolean("FCR_GATE_HEALTH_ENABLED", true)?;
+        let metrics_enabled = boolean("FCR_GATE_METRICS_ENABLED", false)?;
         let gate_mode =
             parse_gate_mode(&env::var("RFID_GATE_MODE").unwrap_or_else(|_| "disabled".into()))?;
         let lpr_correlation_mode = parse_lpr_correlation_mode(
@@ -177,6 +180,7 @@ impl Config {
             bail!("RFID_DISCOVERY_MIN_CONFIDENCE_PERCENT must not exceed 100");
         }
         let web_bind = web_bind()?;
+        let metrics_bind = metrics_bind()?;
         let unifi_needed = web_enabled
             || gate_mode.enabled()
             || lpr_correlation_mode.enabled()
@@ -243,6 +247,8 @@ impl Config {
                 120_000,
             )?),
             web_bind,
+            metrics_enabled,
+            metrics_bind,
             claim_window: Duration::from_millis(positive_number("RFID_CLAIM_WINDOW_MS", 60_000)?),
             lpr_correlation_mode,
             lpr_correlation_window,
@@ -367,6 +373,24 @@ fn web_bind() -> Result<SocketAddr> {
         bail!("FCR_GATE_WEB_BIND must be a loopback address");
     }
     Ok(SocketAddr::new(ip, number("FCR_GATE_WEB_PORT", 8080)?))
+}
+
+fn metrics_bind() -> Result<SocketAddr> {
+    let ip: IpAddr = env::var("FCR_GATE_METRICS_BIND")
+        .unwrap_or_else(|_| "127.0.0.1".into())
+        .parse()
+        .context("FCR_GATE_METRICS_BIND must be an IP address")?;
+    validate_metrics_bind(ip, positive_number("FCR_GATE_METRICS_PORT", 9101)?)
+}
+
+fn validate_metrics_bind(ip: IpAddr, port: u16) -> Result<SocketAddr> {
+    if ip.is_unspecified() {
+        bail!("FCR_GATE_METRICS_BIND must not expose metrics on every interface");
+    }
+    if port == 0 {
+        bail!("FCR_GATE_METRICS_PORT must be greater than zero");
+    }
+    Ok(SocketAddr::new(ip, port))
 }
 
 fn validate_uuid(value: &str, name: &str) -> Result<String> {
@@ -545,5 +569,20 @@ mod tests {
             LprCorrelationMode::Live
         );
         assert!(parse_discovery_mode("true").is_err());
+    }
+
+    #[test]
+    fn metrics_cannot_bind_every_network_interface() {
+        assert!(validate_metrics_bind("0.0.0.0".parse().unwrap(), 9101).is_err());
+        assert!(validate_metrics_bind("::".parse().unwrap(), 9101).is_err());
+        assert_eq!(
+            validate_metrics_bind("100.89.168.42".parse().unwrap(), 9101).unwrap(),
+            "100.89.168.42:9101".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn metrics_port_must_be_nonzero() {
+        assert!(validate_metrics_bind("127.0.0.1".parse().unwrap(), 0).is_err());
     }
 }

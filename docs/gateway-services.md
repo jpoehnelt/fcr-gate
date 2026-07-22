@@ -19,6 +19,8 @@ flowchart LR
     E <-->|"IoT Device Interface"| R["Impinj R700"]
     E -->|"current user + policy + schedule"| UA["UniFi Access API"]
     UA -->|"attributed remote unlock"| G["Entry Gate"]
+    P["Home-lab Prometheus"] -->|"Tailnet scrape"| M["Dedicated /metrics listener"]
+    M --> E
 ```
 
 ## Safety boundary
@@ -31,6 +33,8 @@ flowchart LR
 - UniFi gate unlocks use a separate setting and also default to disabled.
 - `/healthz` contains no tag or user data, binds to loopback with the UI, and should
   use a Cloudflare Access service token for external monitoring.
+- `/metrics` uses a separate listener, contains no tag or user labels, and must be
+  restricted to the Prometheus scraper with Tailscale ACLs.
 - Every write must record the operator, requested EPC, result, and timestamp without
   logging reader passwords, tunnel tokens, or other credentials.
 - Reader and Cloudflare credentials live below `/data/fcr-gate/secrets/` with mode
@@ -240,6 +244,44 @@ and reads the durable allocator row.
 The response deliberately excludes TID, EPC, user, vehicle, policy, and error text.
 Use a path-specific Cloudflare Access service-token policy for external monitoring,
 or query `http://127.0.0.1:8080/healthz` locally.
+
+## Prometheus metrics
+
+The Rust service can expose OpenMetrics directly without a sidecar. This listener
+is independent from the loopback operator UI so tailnet scraping cannot reach or
+spoof the UI's Cloudflare Access identity header. It is disabled by default.
+
+Configure `/data/fcr-gate/secrets/gateway.env`:
+
+```dotenv
+FCR_GATE_METRICS_ENABLED=true
+FCR_GATE_METRICS_BIND=100.89.168.42
+FCR_GATE_METRICS_PORT=9101
+```
+
+Do not use `0.0.0.0`; configuration rejects an unspecified bind address. Restrict
+TCP port 9101 to the home-lab Prometheus identity with Tailscale ACLs. A static
+Prometheus scrape target is sufficient:
+
+```yaml
+scrape_configs:
+  - job_name: fcr-gate
+    static_configs:
+      - targets: ["100.89.168.42:9101"]
+```
+
+The endpoint exports:
+
+- Reader connection state, latest activity timestamp, event count, and reconnects.
+- SQLite health, process build information, encoding attempts, completions, and
+  bounded failure reasons.
+- LPR correlation outcomes, gate decisions by dry-run/live mode, and UniFi API
+  latency histograms by bounded operation and result.
+
+EPC, TID, plate, user, email, policy, and error strings are deliberately excluded
+from labels and metric values. Use `time() -
+fcr_gate_reader_last_activity_timestamp_seconds` to alert on stale reader data;
+Prometheus supplies its normal `up` series for endpoint availability.
 
 Impinj references:
 

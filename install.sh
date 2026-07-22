@@ -244,11 +244,15 @@ Safety defaults on a first install:
   RFID_DISCOVERY_MODE=disabled
   RFID_GATE_MODE=disabled
   FCR_GATE_WEB_ENABLED=false
+  FCR_GATE_METRICS_ENABLED=false
 
 Useful checks:
   systemctl status fcr-rfid-encoder --no-pager
   journalctl -u fcr-rfid-encoder -f
   curl --fail-with-body http://127.0.0.1:8080/healthz
+  # After enabling metrics, load the configured listener values:
+  . $environment_file
+  curl --fail-with-body "http://\${FCR_GATE_METRICS_BIND}:\${FCR_GATE_METRICS_PORT}/metrics"
   /data/fcr-gate/bin/fcr-gate-admin --help
 
 Configuration: $environment_file
