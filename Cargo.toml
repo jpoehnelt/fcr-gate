@@ -1,6 +1,6 @@
 [package]
 name = "fcr-rfid-encoder"
-version = "2026.7.20"
+version = "2026.7.22"
 edition = "2024"
 rust-version = "1.85"
 description = "FCR Gate UniFi Access admin CLI and Impinj R700 encoder service"
