@@ -513,6 +513,8 @@ mod tests {
             health_enabled: true,
             health_stale_after: Duration::from_secs(120),
             web_bind: "127.0.0.1:8080".parse().unwrap(),
+            metrics_enabled: false,
+            metrics_bind: "127.0.0.1:9101".parse().unwrap(),
             claim_window: Duration::from_secs(60),
             lpr_correlation_mode: LprCorrelationMode::Disabled,
             lpr_correlation_window: Duration::from_secs(10),

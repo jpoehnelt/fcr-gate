@@ -10,6 +10,7 @@ use fcr_rfid_encoder::{
     config::{Config, GateMode, LprCorrelationMode, normalize_hex, state_db_path},
     engine::{Action, Engine},
     impinj::ImpinjClient,
+    metrics::{self as prometheus_metrics, AppMetrics},
     model::{DiscoveryObservation, ReaderEvent, TagObservation},
     store::{DiscoveryCandidate, PassageMatchOutcome, Store, now_ms},
     unifi::{AuthorizationDecision, LprCorrelation, UnifiClient},
@@ -55,6 +56,7 @@ enum Command {
 
 struct GateRuntime {
     unifi: Option<UnifiClient>,
+    metrics: AppMetrics,
     last_attempts: HashMap<String, Instant>,
     lpr_last_attempts: HashMap<String, Instant>,
     discovery_last_attempts: HashMap<String, Instant>,
@@ -65,6 +67,14 @@ struct CachedDiscoveryLpr {
     fetched_at: Instant,
     observed_at_ms: i64,
     correlation: LprCorrelation,
+}
+
+fn lpr_outcome(correlation: &LprCorrelation) -> &'static str {
+    match correlation {
+        LprCorrelation::NoMatch => "none",
+        LprCorrelation::Match(_) => "matched",
+        LprCorrelation::Ambiguous { .. } => "ambiguous",
+    }
 }
 
 #[tokio::main]
@@ -89,6 +99,7 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let config = Config::from_env()?;
+    let metrics = AppMetrics::new();
     let mut store = Store::open(&config.state_db, config.actor.clone())?;
     let recovered = store.recover_interrupted()?;
     if recovered > 0 {
@@ -102,13 +113,18 @@ async fn run() -> Result<()> {
         || config.gate_mode.enabled()
         || config.lpr_correlation_mode.enabled()
         || config.discovery_mode.enabled())
-    .then(|| UnifiClient::new(&config))
+    .then(|| UnifiClient::with_metrics(&config, metrics.clone()))
     .transpose()?;
 
     let (sender, mut receiver) = mpsc::channel::<ReaderEvent>(4096);
-    let stream_task = tokio::spawn(reader.clone().stream_events(sender));
+    let stream_task = tokio::spawn(reader.clone().stream_events(sender, metrics.clone()));
     let web_handle = if config.web_enabled || config.health_enabled {
-        Some(web::start(&config, unifi.clone(), reader_health).await?)
+        Some(web::start(&config, unifi.clone(), reader_health.clone()).await?)
+    } else {
+        None
+    };
+    let metrics_handle = if config.metrics_enabled {
+        Some(prometheus_metrics::start(&config, metrics.clone(), reader_health).await?)
     } else {
         None
     };
@@ -122,6 +138,7 @@ async fn run() -> Result<()> {
     let mut dry_run_reported = HashSet::new();
     let mut gate = GateRuntime {
         unifi,
+        metrics,
         last_attempts: HashMap::new(),
         lpr_last_attempts: HashMap::new(),
         discovery_last_attempts: HashMap::new(),
@@ -139,6 +156,7 @@ async fn run() -> Result<()> {
         confirm_reads = config.confirm_reads,
         operator_ui = config.web_enabled,
         health_endpoint = config.health_enabled,
+        metrics_endpoint = config.metrics_enabled,
         lpr_correlation_mode = config.lpr_correlation_mode.as_str(),
         discovery_mode = config.discovery_mode.as_str(),
         gate_mode = config.gate_mode.as_str(),
@@ -162,6 +180,9 @@ async fn run() -> Result<()> {
                 if let Some(web_handle) = web_handle {
                     web_handle.shutdown().await;
                 }
+                if let Some(metrics_handle) = metrics_handle {
+                    metrics_handle.shutdown().await;
+                }
                 return Ok(());
             }
             _ = timeout_check.tick() => {
@@ -173,6 +194,7 @@ async fn run() -> Result<()> {
                         config.retry_cooldown,
                         config.max_attempts,
                     )?;
+                    gate.metrics.encoding_failure("timeout");
                     warn!(%tid, "encoding transaction timed out and was released for retry");
                 }
             }
@@ -181,6 +203,7 @@ async fn run() -> Result<()> {
                     stream_task.abort();
                     anyhow::bail!("reader event task stopped unexpectedly");
                 };
+                gate.metrics.reader_event();
                 if let Err(error) = handle_event(
                     &config,
                     &reader,
@@ -287,6 +310,7 @@ async fn handle_event(
                 return Ok(());
             }
 
+            gate.metrics.encoding_attempt();
             match reader
                 .queue_epc_write(
                     &encoding.tid,
@@ -306,6 +330,7 @@ async fn handle_event(
                     );
                 }
                 Err(error) => {
+                    gate.metrics.encoding_failure("queue");
                     store.mark_post_failed(
                         &encoding.tid,
                         &error.to_string(),
@@ -321,11 +346,13 @@ async fn handle_event(
             info!(%tid, %epc, "all EPC words and read-back verified; awaiting inventory confirmation");
         }
         Action::AccessFailed { tid, reason } => {
+            gate.metrics.encoding_failure("access");
             store.mark_access_failed(&tid, &reason, config.retry_cooldown, config.max_attempts)?;
             engine.clear_in_flight(&tid);
             warn!(%tid, %reason, "EPC write transaction failed");
         }
         Action::Completed { tid, epc } => {
+            gate.metrics.encoding_completed();
             store.mark_completed(&tid, &epc)?;
             store.record_seen(&tid, &epc, observation.peak_rssi_cdbm)?;
             engine.clear_in_flight(&tid);
@@ -333,6 +360,7 @@ async fn handle_event(
             maybe_correlate_lpr(config, gate, store, &observation).await?;
         }
         Action::Conflict { tid, observed_epc } => {
+            gate.metrics.encoding_failure("conflict");
             store.mark_conflict(&tid, &observed_epc)?;
             engine.clear_in_flight(&tid);
             error!(%tid, %observed_epc, "TID reported an EPC different from its durable assignment");
@@ -433,6 +461,7 @@ async fn maybe_learn_discovered_tag(
         });
         correlation
     };
+    gate.metrics.lpr_correlation(lpr_outcome(&correlation));
 
     let lpr_match = match correlation {
         LprCorrelation::NoMatch => return Ok(()),
@@ -670,7 +699,9 @@ async fn maybe_correlate_lpr(
         .as_ref()
         .context("LPR correlation requires a UniFi Access client")?;
 
-    match unifi.find_lpr_user_match(since, now).await? {
+    let correlation = unifi.find_lpr_user_match(since, now).await?;
+    gate.metrics.lpr_correlation(lpr_outcome(&correlation));
+    match correlation {
         LprCorrelation::NoMatch => {}
         LprCorrelation::Ambiguous { reason } => {
             store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
@@ -797,6 +828,8 @@ async fn maybe_unlock_gate_identity(
                     "granted",
                     Some(&policy_name),
                 )?;
+                gate.metrics
+                    .gate_decision("granted", config.gate_mode.as_str());
                 info!(
                     tag = %tag_key,
                     %epc,
@@ -819,6 +852,8 @@ async fn maybe_unlock_gate_identity(
                         "granted",
                         Some(&policy_name),
                     )?;
+                    gate.metrics
+                        .gate_decision("granted", config.gate_mode.as_str());
                     info!(
                         tag = %tag_key,
                         %epc,
@@ -836,6 +871,8 @@ async fn maybe_unlock_gate_identity(
                         "error",
                         Some(&error.to_string()),
                     )?;
+                    gate.metrics
+                        .gate_decision("error", config.gate_mode.as_str());
                     return Err(error.context("authorized RFID unlock command failed"));
                 }
             }
@@ -849,6 +886,8 @@ async fn maybe_unlock_gate_identity(
                 "denied",
                 Some(&reason),
             )?;
+            gate.metrics
+                .gate_decision("denied", config.gate_mode.as_str());
             warn!(
                 tag = %tag_key,
                 %epc,
@@ -866,6 +905,8 @@ async fn maybe_unlock_gate_identity(
                 "error",
                 Some(&error.to_string()),
             )?;
+            gate.metrics
+                .gate_decision("error", config.gate_mode.as_str());
             return Err(error.context("could not verify current UniFi access; gate remains locked"));
         }
     }
@@ -1163,6 +1204,8 @@ mod tests {
             health_enabled: false,
             health_stale_after: Duration::from_secs(120),
             web_bind: "127.0.0.1:8080".parse().unwrap(),
+            metrics_enabled: false,
+            metrics_bind: "127.0.0.1:9101".parse().unwrap(),
             claim_window: Duration::from_secs(60),
             lpr_correlation_mode: LprCorrelationMode::Disabled,
             lpr_correlation_window: Duration::from_secs(10),
@@ -1261,6 +1304,7 @@ mod tests {
         let observation = assigned_tag(&mut store);
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&dry_run).unwrap()),
+            metrics: AppMetrics::new(),
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
@@ -1289,6 +1333,7 @@ mod tests {
         let live = test_config(db, base_url, GateMode::Live);
         let mut live_gate = GateRuntime {
             unifi: Some(UnifiClient::new(&live).unwrap()),
+            metrics: AppMetrics::new(),
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
@@ -1320,6 +1365,7 @@ mod tests {
         let observation = assigned_tag(&mut store);
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
+            metrics: AppMetrics::new(),
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
@@ -1366,6 +1412,7 @@ mod tests {
         ];
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
+            metrics: AppMetrics::new(),
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
@@ -1396,6 +1443,7 @@ mod tests {
         let mut store = Store::open(&db, "gate-auto").unwrap();
         let mut restarted_gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
+            metrics: AppMetrics::new(),
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
@@ -1437,6 +1485,7 @@ mod tests {
         let observation = discovered_tid("E2809999", "11223344556677889900AABB");
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
+            metrics: AppMetrics::new(),
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
@@ -1488,6 +1537,7 @@ mod tests {
         let observation = discovered_tid("E280AAAA", "A1223344556677889900AABB");
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
+            metrics: AppMetrics::new(),
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
@@ -1546,6 +1596,7 @@ mod tests {
         ];
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
+            metrics: AppMetrics::new(),
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
@@ -1594,6 +1645,7 @@ mod tests {
         buffered.observed_at_ms -= 86_400_000;
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
+            metrics: AppMetrics::new(),
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
@@ -1640,6 +1692,7 @@ mod tests {
         let mut observation = discovered_tid("E280FFFF", "F1223344556677889900AABB");
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
+            metrics: AppMetrics::new(),
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),

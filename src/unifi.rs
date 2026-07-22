@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -10,7 +10,7 @@ use reqwest::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 
-use crate::config::Config;
+use crate::{config::Config, metrics::AppMetrics};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const USERS_PER_PAGE: usize = 100;
@@ -23,6 +23,7 @@ pub struct UnifiClient {
     base_url: String,
     api_key: String,
     entry_gate_door_id: String,
+    metrics: AppMetrics,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -207,6 +208,10 @@ struct Holiday {
 
 impl UnifiClient {
     pub fn new(config: &Config) -> Result<Self> {
+        Self::with_metrics(config, AppMetrics::new())
+    }
+
+    pub fn with_metrics(config: &Config, metrics: AppMetrics) -> Result<Self> {
         let mut builder = Client::builder()
             .connect_timeout(REQUEST_TIMEOUT)
             .danger_accept_invalid_certs(!config.unifi_verify_tls);
@@ -232,6 +237,7 @@ impl UnifiClient {
                 .clone()
                 .context("UniFi Access API key is not configured")?,
             entry_gate_door_id: config.entry_gate_door_id.clone(),
+            metrics,
         })
     }
 
@@ -245,6 +251,7 @@ impl UnifiClient {
                         ("page_size", USERS_PER_PAGE.to_string()),
                     ]),
                     "list UniFi users",
+                    "list_users",
                 )
                 .await?;
             let page_len = response.data.len();
@@ -287,11 +294,12 @@ impl UnifiClient {
                     .post(self.url("/system/logs"))
                     .query(&[("page_num", 1_usize), ("page_size", SYSTEM_LOGS_PER_PAGE)])
                     .json(&json!({
-                        "topic": "door_openings",
-                        "since": since.timestamp(),
-                        "until": until.timestamp(),
+                            "topic": "door_openings",
+                            "since": since.timestamp(),
+                            "until": until.timestamp(),
                     })),
                 "fetch recent UniFi Entry Gate plate events",
+                "fetch_lpr_events",
             )
             .await?;
         let truncated = response.pagination.as_ref().map_or_else(
@@ -388,6 +396,7 @@ impl UnifiClient {
                     .put(self.url(&format!("/doors/{}/unlock", self.entry_gate_door_id)))
                     .json(&payload),
                 "unlock the Entry Gate",
+                "unlock_gate",
             )
             .await?;
         Ok(())
@@ -398,6 +407,7 @@ impl UnifiClient {
             .get_envelope(
                 self.http.get(self.url(&format!("/users/{user_id}"))),
                 "fetch UniFi user",
+                "fetch_user",
             )
             .await?;
         Ok(response.data)
@@ -410,6 +420,7 @@ impl UnifiClient {
                     .get(self.url(&format!("/users/{user_id}/access_policies")))
                     .query(&[("only_user_policies", "false")]),
                 "fetch UniFi user access policies",
+                "fetch_user_policies",
             )
             .await?;
         Ok(response.data)
@@ -426,6 +437,7 @@ impl UnifiClient {
                             self.http
                                 .get(self.url(&format!("/door_groups/{}", resource.id))),
                             "fetch UniFi door group",
+                            "fetch_door_group",
                         )
                         .await?;
                     if response
@@ -450,21 +462,34 @@ impl UnifiClient {
                 self.http
                     .get(self.url(&format!("/access_policies/schedules/{schedule_id}"))),
                 "fetch UniFi access schedule",
+                "fetch_schedule",
             )
             .await?;
         Ok(response.data)
     }
 
-    async fn get_envelope<T>(&self, request: RequestBuilder, operation: &str) -> Result<Envelope<T>>
+    async fn get_envelope<T>(
+        &self,
+        request: RequestBuilder,
+        operation: &str,
+        metric_operation: &'static str,
+    ) -> Result<Envelope<T>>
     where
         T: DeserializeOwned,
     {
-        let response = self
-            .authorized(request.timeout(REQUEST_TIMEOUT))
-            .send()
-            .await
-            .with_context(|| format!("failed to {operation}"))?;
-        parse_envelope(response, operation).await
+        let started = Instant::now();
+        let result = async {
+            let response = self
+                .authorized(request.timeout(REQUEST_TIMEOUT))
+                .send()
+                .await
+                .with_context(|| format!("failed to {operation}"))?;
+            parse_envelope(response, operation).await
+        }
+        .await;
+        self.metrics
+            .unifi_request(metric_operation, result.is_ok(), started.elapsed());
+        result
     }
 
     fn authorized(&self, request: RequestBuilder) -> RequestBuilder {
