@@ -1,8 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -244,14 +240,18 @@ impl AppMetrics {
             .observe(duration.as_secs_f64());
     }
 
-    fn render(&self, reader_health: &ReaderHealth, db_path: &Path) -> Result<String> {
+    async fn render(&self, reader_health: &ReaderHealth, db_path: Arc<PathBuf>) -> Result<String> {
         let snapshot = reader_health.snapshot();
         self.reader_connected.set(i64::from(snapshot.connected));
         self.reader_last_activity_timestamp_seconds
             .set(snapshot.last_activity_ms.unwrap_or_default() / 1000);
-        let database_ok = Store::open(db_path, "metrics")
-            .and_then(|store| store.health_check())
-            .is_ok();
+        let database_ok = tokio::task::spawn_blocking(move || {
+            Store::open(&db_path, "metrics")
+                .and_then(|store| store.health_check())
+                .is_ok()
+        })
+        .await
+        .unwrap_or(false);
         self.database_healthy.set(i64::from(database_ok));
 
         let mut body = String::new();
@@ -291,19 +291,23 @@ impl MetricsHandle {
     }
 }
 
-pub async fn start(
-    config: &Config,
-    metrics: AppMetrics,
-    reader_health: ReaderHealth,
-) -> Result<MetricsHandle> {
-    let listener = TcpListener::bind(config.metrics_bind)
+pub async fn bind(config: &Config) -> Result<TcpListener> {
+    TcpListener::bind(config.metrics_bind)
         .await
         .with_context(|| {
             format!(
                 "failed to bind Prometheus metrics to {}",
                 config.metrics_bind
             )
-        })?;
+        })
+}
+
+pub fn start(
+    config: &Config,
+    metrics: AppMetrics,
+    reader_health: ReaderHealth,
+    listener: TcpListener,
+) -> MetricsHandle {
     let state = MetricsState {
         metrics,
         reader_health,
@@ -323,14 +327,18 @@ pub async fn start(
         }
     });
     info!(%address, "Prometheus metrics endpoint listening");
-    Ok(MetricsHandle {
+    MetricsHandle {
         shutdown: Some(shutdown_sender),
         task,
-    })
+    }
 }
 
 async fn metrics_endpoint(State(state): State<MetricsState>) -> Response {
-    match state.metrics.render(&state.reader_health, &state.db_path) {
+    match state
+        .metrics
+        .render(&state.reader_health, state.db_path.clone())
+        .await
+    {
         Ok(body) => {
             let mut response = body.into_response();
             response.headers_mut().insert(
@@ -352,8 +360,8 @@ mod tests {
     use axum::body::to_bytes;
     use tempfile::tempdir;
 
-    #[test]
-    fn metrics_include_health_counters_histograms_and_no_tag_identity() {
+    #[tokio::test]
+    async fn metrics_include_health_counters_histograms_and_no_tag_identity() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("metrics.sqlite3");
         Store::open(&db_path, "test").unwrap();
@@ -369,7 +377,7 @@ mod tests {
         metrics.gate_decision("granted", "dry-run");
         metrics.unifi_request("fetch_user", true, Duration::from_millis(125));
 
-        let body = metrics.render(&health, &db_path).unwrap();
+        let body = metrics.render(&health, Arc::new(db_path)).await.unwrap();
         assert!(body.contains("fcr_gate_reader_connected 1"));
         assert!(body.contains("fcr_gate_database_healthy 1"));
         assert!(body.contains("fcr_gate_reader_events_total 1"));
@@ -389,12 +397,15 @@ mod tests {
         assert!(!body.contains("operator@example.com"));
     }
 
-    #[test]
-    fn database_failure_is_exposed_without_breaking_the_scrape() {
+    #[tokio::test]
+    async fn database_failure_is_exposed_without_breaking_the_scrape() {
         let dir = tempdir().unwrap();
         let metrics = AppMetrics::new();
         let health = ReaderHealth::default();
-        let body = metrics.render(&health, dir.path()).unwrap();
+        let body = metrics
+            .render(&health, Arc::new(dir.path().to_path_buf()))
+            .await
+            .unwrap();
         assert!(body.contains("fcr_gate_reader_connected 0"));
         assert!(body.contains("fcr_gate_database_healthy 0"));
     }

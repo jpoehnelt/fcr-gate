@@ -380,12 +380,15 @@ fn metrics_bind() -> Result<SocketAddr> {
         .unwrap_or_else(|_| "127.0.0.1".into())
         .parse()
         .context("FCR_GATE_METRICS_BIND must be an IP address")?;
-    validate_metrics_bind(ip, number("FCR_GATE_METRICS_PORT", 9101)?)
+    validate_metrics_bind(ip, positive_number("FCR_GATE_METRICS_PORT", 9101)?)
 }
 
 fn validate_metrics_bind(ip: IpAddr, port: u16) -> Result<SocketAddr> {
     if ip.is_unspecified() {
         bail!("FCR_GATE_METRICS_BIND must not expose metrics on every interface");
+    }
+    if port == 0 {
+        bail!("FCR_GATE_METRICS_PORT must be greater than zero");
     }
     Ok(SocketAddr::new(ip, port))
 }
@@ -576,5 +579,10 @@ mod tests {
             validate_metrics_bind("100.89.168.42".parse().unwrap(), 9101).unwrap(),
             "100.89.168.42:9101".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn metrics_port_must_be_nonzero() {
+        assert!(validate_metrics_bind("127.0.0.1".parse().unwrap(), 0).is_err());
     }
 }

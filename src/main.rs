@@ -107,27 +107,32 @@ async fn run() -> Result<()> {
     }
 
     let reader = ImpinjClient::new(&config)?;
-    reader.ensure_profile(&config).await?;
     let reader_health = reader.health();
+    let web_listener = if config.web_enabled || config.health_enabled {
+        Some(web::bind(&config).await?)
+    } else {
+        None
+    };
+    let metrics_listener = if config.metrics_enabled {
+        Some(prometheus_metrics::bind(&config).await?)
+    } else {
+        None
+    };
     let unifi = (config.web_enabled
         || config.gate_mode.enabled()
         || config.lpr_correlation_mode.enabled()
         || config.discovery_mode.enabled())
     .then(|| UnifiClient::with_metrics(&config, metrics.clone()))
     .transpose()?;
+    reader.ensure_profile(&config).await?;
 
     let (sender, mut receiver) = mpsc::channel::<ReaderEvent>(4096);
     let stream_task = tokio::spawn(reader.clone().stream_events(sender, metrics.clone()));
-    let web_handle = if config.web_enabled || config.health_enabled {
-        Some(web::start(&config, unifi.clone(), reader_health.clone()).await?)
-    } else {
-        None
-    };
-    let metrics_handle = if config.metrics_enabled {
-        Some(prometheus_metrics::start(&config, metrics.clone(), reader_health).await?)
-    } else {
-        None
-    };
+    let web_handle = web_listener
+        .map(|listener| web::start(&config, unifi.clone(), reader_health.clone(), listener));
+    let metrics_handle = metrics_listener.map(|listener| {
+        prometheus_metrics::start(&config, metrics.clone(), reader_health, listener)
+    });
     let mut engine = Engine::new(
         config.antenna_port,
         config.default_epc.clone(),

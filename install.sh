@@ -250,8 +250,9 @@ Useful checks:
   systemctl status fcr-rfid-encoder --no-pager
   journalctl -u fcr-rfid-encoder -f
   curl --fail-with-body http://127.0.0.1:8080/healthz
-  # After enabling FCR_GATE_METRICS_ENABLED:
-  curl --fail-with-body http://100.89.168.42:9101/metrics
+  # After enabling metrics, load the configured listener values:
+  . $environment_file
+  curl --fail-with-body "http://\${FCR_GATE_METRICS_BIND}:\${FCR_GATE_METRICS_PORT}/metrics"
   /data/fcr-gate/bin/fcr-gate-admin --help
 
 Configuration: $environment_file
