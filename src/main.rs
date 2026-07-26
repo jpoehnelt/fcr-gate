@@ -47,6 +47,14 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Associate a mature visitor-backed discovery candidate with a permanent user.
+    AssociateDiscovered {
+        tag_key: String,
+        unifi_user_id: String,
+        /// Persist the association. Without this flag, only print the validated plan.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Permanently revoke a learned tag assignment.
     RevokeLearned { tag_key: String },
     /// Clear a suspended learned tag's evidence so it can learn again.
@@ -82,6 +90,11 @@ async fn main() -> Result<()> {
         Command::GateEvents { limit } => gate_events(limit),
         Command::Retry { tid } => retry(&tid),
         Command::DiscoveryStatus { limit } => discovery_status(limit),
+        Command::AssociateDiscovered {
+            tag_key,
+            unifi_user_id,
+            apply,
+        } => associate_discovered(&tag_key, &unifi_user_id, apply).await,
         Command::RevokeLearned { tag_key } => revoke_learned(&tag_key),
         Command::ResetLearned { tag_key } => reset_learned(&tag_key),
     }
@@ -465,7 +478,8 @@ async fn maybe_learn_discovered_tag(
         seen.passage_id,
         lpr_match.timestamp.timestamp_millis(),
         &lpr_match.plate,
-        &lpr_match.user_id,
+        &lpr_match.actor_type,
+        &lpr_match.actor_id,
     )?;
     match outcome {
         PassageMatchOutcome::Duplicate => return Ok(()),
@@ -495,13 +509,15 @@ async fn maybe_learn_discovered_tag(
         if assignment.status != "active" {
             return Ok(());
         }
-        if assignment.owner.unifi_user_id == lpr_match.user_id
+        if assignment.lpr_actor_type == lpr_match.actor_type
+            && assignment.lpr_actor_id == lpr_match.actor_id
             && assignment.plate == lpr_match.plate
         {
             if config.discovery_mode == LprCorrelationMode::Live {
                 store.renew_discovered_lease(
                     &observation.tag_key,
-                    &lpr_match.user_id,
+                    &lpr_match.actor_type,
+                    &lpr_match.actor_id,
                     &lpr_match.plate,
                     config.discovery_lease,
                 )?;
@@ -512,7 +528,8 @@ async fn maybe_learn_discovered_tag(
         }
         let conflicts = store.count_discovery_conflicts(
             &observation.tag_key,
-            &assignment.owner.unifi_user_id,
+            &assignment.lpr_actor_type,
+            &assignment.lpr_actor_id,
             &assignment.plate,
             config.discovery_evidence_retention,
         )?;
@@ -565,11 +582,26 @@ async fn maybe_learn_discovered_tag(
     if !candidate.ready {
         return Ok(());
     }
+    if candidate.lpr_actor_type == "visitor" {
+        if store.record_discovery_candidate_audit(&candidate)? {
+            info!(
+                tag = %candidate.tag_key,
+                epc = %candidate.epc,
+                plate = %candidate.plate,
+                visitor_id = %candidate.lpr_actor_id,
+                occurrences = candidate.matched_occurrences,
+                days = candidate.distinct_days,
+                confidence = candidate.confidence_percent,
+                "visitor-backed RFID evidence is ready for manual resident association"
+            );
+        }
+        return Ok(());
+    }
     let user = match gate
         .unifi
         .as_ref()
         .context("RFID discovery requires a UniFi Access client")?
-        .validate_claim_user(&candidate.unifi_user_id)
+        .validate_claim_user(&candidate.lpr_actor_id)
         .await
     {
         Ok(user) => user,
@@ -599,7 +631,12 @@ async fn maybe_learn_discovered_tag(
         return Ok(());
     }
 
-    store.activate_discovered_tag(&candidate, &user.display_name(), config.discovery_lease)?;
+    store.activate_discovered_tag(
+        &candidate,
+        &user.id,
+        &user.display_name(),
+        config.discovery_lease,
+    )?;
     gate.last_attempts
         .insert(observation.tag_key.clone(), Instant::now());
     info!(
@@ -688,14 +725,37 @@ async fn maybe_correlate_lpr(
             );
         }
         LprCorrelation::Match(candidate) => {
-            let user = match unifi.validate_claim_user(&candidate.user_id).await {
+            if candidate.actor_type != "user" {
+                store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
+                let detail = serde_json::json!({
+                    "reason": "visitor-backed LPR evidence requires manual resident association",
+                    "plate": candidate.plate,
+                    "lpr_actor_type": candidate.actor_type,
+                    "lpr_actor_id": candidate.actor_id,
+                })
+                .to_string();
+                store.record_lpr_correlation_audit(
+                    &observation.tid,
+                    &observation.epc,
+                    "lpr-correlation-ambiguous",
+                    &detail,
+                )?;
+                info!(
+                    tid = %observation.tid,
+                    plate = %candidate.plate,
+                    visitor_id = %candidate.actor_id,
+                    "visitor-backed LPR evidence requires manual resident association"
+                );
+                return Ok(());
+            }
+            let user = match unifi.validate_claim_user(&candidate.actor_id).await {
                 Ok(user) => user,
                 Err(error) => {
                     store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
                     let detail = serde_json::json!({
                         "reason": error.to_string(),
                         "plate": candidate.plate,
-                        "unifi_user_id": candidate.user_id,
+                        "unifi_user_id": candidate.actor_id,
                     })
                     .to_string();
                     store.record_lpr_correlation_audit(
@@ -919,7 +979,7 @@ fn discovery_status(limit: usize) -> Result<()> {
     let config = Config::from_env()?;
     let store = Store::open(&config.state_db, "status")?;
     println!(
-        "STATUS\tIDENTITY\tEPC\tPLATE\tMATCHES\tDAYS\tPASSAGES\tCONFIDENCE\tCONFLICTS\tUNIFI USER"
+        "STATUS\tIDENTITY\tEPC\tPLATE\tMATCHES\tDAYS\tPASSAGES\tCONFIDENCE\tCONFLICTS\tLPR ACTOR TYPE\tLPR ACTOR ID"
     );
     for mut candidate in store.list_discovery_candidates(
         limit.clamp(1, 500),
@@ -940,12 +1000,17 @@ fn discovery_status(limit: usize) -> Result<()> {
 }
 
 fn print_discovery_candidate(candidate: &DiscoveryCandidate) {
-    let status = candidate
-        .assignment_status
-        .as_deref()
-        .unwrap_or(if candidate.ready { "ready" } else { "learning" });
+    let status = candidate.assignment_status.as_deref().unwrap_or(
+        if candidate.ready && candidate.lpr_actor_type == "visitor" {
+            "needs-resident"
+        } else if candidate.ready {
+            "ready"
+        } else {
+            "learning"
+        },
+    );
     println!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}%\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}%\t{}\t{}\t{}",
         status,
         candidate.tag_key,
         candidate.epc,
@@ -955,8 +1020,64 @@ fn print_discovery_candidate(candidate: &DiscoveryCandidate) {
         candidate.total_passages,
         candidate.confidence_percent,
         candidate.conflicting_occurrences,
-        candidate.unifi_user_id,
+        candidate.lpr_actor_type,
+        candidate.lpr_actor_id,
     );
+}
+
+async fn associate_discovered(tag_key: &str, unifi_user_id: &str, apply: bool) -> Result<()> {
+    let tag_key = normalize_discovery_key(tag_key)?;
+    let config = Config::from_env()?;
+    let mut store = Store::open(&config.state_db, "manual-cli")?;
+    let candidate = store
+        .discovery_candidate(
+            &tag_key,
+            config.discovery_evidence_retention,
+            config.discovery_min_occurrences,
+            config.discovery_min_days,
+            config.discovery_min_confidence_percent,
+            config.discovery_conflict_occurrences,
+        )?
+        .with_context(|| format!("discovered tag {tag_key} has no correlated LPR evidence"))?;
+    if !candidate.ready {
+        anyhow::bail!(
+            "discovered tag {tag_key} has not met the configured occurrence, day, confidence, and conflict thresholds"
+        );
+    }
+    if candidate.lpr_actor_type != "visitor" {
+        anyhow::bail!(
+            "discovered tag {tag_key} is backed by a {} actor and does not require visitor association",
+            candidate.lpr_actor_type
+        );
+    }
+    let unifi = UnifiClient::new(&config)?;
+    let user = unifi.validate_claim_user(unifi_user_id).await?;
+    println!(
+        "{}: tag {} / EPC {} / plate {} / visitor {} -> user {} ({})",
+        if apply { "applying" } else { "dry-run" },
+        candidate.tag_key,
+        candidate.epc,
+        candidate.plate,
+        candidate.lpr_actor_id,
+        user.display_name(),
+        user.id,
+    );
+    if !apply {
+        println!("no changes made; re-run with --apply to persist this association");
+        return Ok(());
+    }
+    store.activate_discovered_tag(
+        &candidate,
+        &user.id,
+        &user.display_name(),
+        config.discovery_lease,
+    )?;
+    println!(
+        "associated discovered tag {} with {}",
+        candidate.tag_key,
+        user.display_name()
+    );
+    Ok(())
 }
 
 fn revoke_learned(tag_key: &str) -> Result<()> {
@@ -1233,11 +1354,21 @@ mod tests {
     }
 
     fn lpr_hit(timestamp: DateTime<Utc>, plate: &str, result: &str) -> Value {
+        lpr_hit_for_actor(timestamp, plate, result, "user", USER_ID)
+    }
+
+    fn lpr_hit_for_actor(
+        timestamp: DateTime<Utc>,
+        plate: &str,
+        result: &str,
+        actor_type: &str,
+        actor_id: &str,
+    ) -> Value {
         json!({
             "@timestamp": timestamp.to_rfc3339(),
             "_source": {
                 "actor": if result == "ACCESS" {
-                    json!({"type": "user", "id": USER_ID})
+                    json!({"type": actor_type, "id": actor_id})
                 } else {
                     json!({"type": "", "id": ""})
                 },
@@ -1519,6 +1650,64 @@ mod tests {
                 .is_none()
         );
         assert_eq!(counts.user_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.unlocks.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn visitor_lpr_discovery_records_evidence_without_validating_or_assigning_a_user() {
+        let (base_url, counts, server) = mock_unifi(true).await;
+        let directory = tempdir().unwrap();
+        let db = directory.path().join("state.sqlite3");
+        let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
+        config.discovery_mode = LprCorrelationMode::DryRun;
+        config.discovery_min_occurrences = 1;
+        config.discovery_min_days = 1;
+        config.discovery_min_confidence_percent = 100;
+        config.discovery_poll = Duration::from_millis(1);
+        let visitor_id = "27d2f099-99df-429b-becb-1399a6937e5b";
+        *counts.lpr_hits.lock().unwrap() = vec![lpr_hit_for_actor(
+            Utc::now() - chrono::Duration::milliseconds(100),
+            "ABC123",
+            "ACCESS",
+            "visitor",
+            visitor_id,
+        )];
+        let mut store = Store::open(&db, "gate-auto").unwrap();
+        let observation = discovered_tid("E280AAAB", "A2223344556677889900AABB");
+        let mut gate = GateRuntime {
+            unifi: Some(UnifiClient::new(&config).unwrap()),
+            last_attempts: HashMap::new(),
+            lpr_last_attempts: HashMap::new(),
+            discovery_last_attempts: HashMap::new(),
+            discovery_lpr_cache: None,
+        };
+
+        maybe_learn_discovered_tag(&config, &mut gate, &mut store, &observation)
+            .await
+            .unwrap();
+
+        let candidate = store
+            .discovery_candidate(
+                &observation.tag_key,
+                config.discovery_evidence_retention,
+                1,
+                1,
+                100,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(candidate.ready);
+        assert_eq!(candidate.lpr_actor_type, "visitor");
+        assert_eq!(candidate.lpr_actor_id, visitor_id);
+        assert!(
+            store
+                .learned_assignment(&observation.tag_key)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(counts.user_reads.load(Ordering::SeqCst), 0);
         assert_eq!(counts.unlocks.load(Ordering::SeqCst), 0);
         server.abort();
     }

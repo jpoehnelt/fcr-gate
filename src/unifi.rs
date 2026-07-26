@@ -70,8 +70,9 @@ pub enum AuthorizationDecision {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LprUserMatch {
-    pub user_id: String,
+pub struct LprIdentityMatch {
+    pub actor_type: String,
+    pub actor_id: String,
     pub plate: String,
     pub timestamp: DateTime<Utc>,
 }
@@ -79,7 +80,7 @@ pub struct LprUserMatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LprCorrelation {
     NoMatch,
-    Match(LprUserMatch),
+    Match(LprIdentityMatch),
     Ambiguous { reason: String },
 }
 
@@ -512,9 +513,9 @@ fn correlate_lpr_hits(
     }
 
     let mut plates = BTreeSet::new();
-    let mut user_pairs = BTreeSet::new();
+    let mut identity_pairs = BTreeSet::new();
     let mut matches = Vec::new();
-    let mut access_without_one_user = false;
+    let mut access_without_one_identity = false;
 
     for hit in hits {
         let Some(authentication) = &hit.source.authentication else {
@@ -571,20 +572,21 @@ fn correlate_lpr_hits(
             continue;
         }
         let Some(actor) = &hit.source.actor else {
-            access_without_one_user = true;
+            access_without_one_identity = true;
             continue;
         };
-        if !actor.kind.eq_ignore_ascii_case("user")
-            || actor.id.trim().is_empty()
+        let actor_type = actor.kind.trim().to_ascii_lowercase();
+        if !matches!(actor_type.as_str(), "user" | "visitor")
             || validate_uuid(actor.id.trim(), "UniFi LPR actor ID").is_err()
         {
-            access_without_one_user = true;
+            access_without_one_identity = true;
             continue;
         }
-        let user_id = actor.id.trim().to_ascii_lowercase();
-        user_pairs.insert((user_id.clone(), plate.clone()));
-        matches.push(LprUserMatch {
-            user_id,
+        let actor_id = actor.id.trim().to_ascii_lowercase();
+        identity_pairs.insert((actor_type.clone(), actor_id.clone(), plate.clone()));
+        matches.push(LprIdentityMatch {
+            actor_type,
+            actor_id,
             plate,
             timestamp,
         });
@@ -598,27 +600,31 @@ fn correlate_lpr_hits(
             ),
         });
     }
-    if access_without_one_user {
+    if access_without_one_identity {
         return Ok(LprCorrelation::Ambiguous {
-            reason: "an Entry Gate access event did not identify one permanent UniFi user".into(),
+            reason: "an Entry Gate access event did not identify one UniFi user or visitor".into(),
         });
     }
-    if user_pairs.len() > 1 {
+    if identity_pairs.len() > 1 {
         return Ok(LprCorrelation::Ambiguous {
             reason: format!(
-                "{} different user/plate pairs received Entry Gate access",
-                user_pairs.len()
+                "{} different identity/plate pairs received Entry Gate access",
+                identity_pairs.len()
             ),
         });
     }
-    let Some((user_id, plate)) = user_pairs.into_iter().next() else {
+    let Some((actor_type, actor_id, plate)) = identity_pairs.into_iter().next() else {
         return Ok(LprCorrelation::NoMatch);
     };
     let matched = matches
         .into_iter()
-        .filter(|candidate| candidate.user_id == user_id && candidate.plate == plate)
+        .filter(|candidate| {
+            candidate.actor_type == actor_type
+                && candidate.actor_id == actor_id
+                && candidate.plate == plate
+        })
         .max_by_key(|candidate| candidate.timestamp)
-        .context("matched UniFi LPR pair had no source event")?;
+        .context("matched UniFi LPR identity had no source event")?;
     Ok(LprCorrelation::Match(matched))
 }
 
@@ -811,8 +817,9 @@ mod tests {
 
         assert_eq!(
             correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
-            LprCorrelation::Match(LprUserMatch {
-                user_id: user.into(),
+            LprCorrelation::Match(LprIdentityMatch {
+                actor_type: "user".into(),
+                actor_id: user.into(),
                 plate: "ABC123".into(),
                 timestamp: Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 11).unwrap(),
             })
@@ -842,21 +849,27 @@ mod tests {
     }
 
     #[test]
-    fn visitor_access_is_not_treated_as_a_permanent_user_match() {
+    fn visitor_access_is_preserved_as_a_distinct_lpr_identity() {
         let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let visitor = "17d2f099-99df-429b-becb-1399a6937e5a";
         let hits = vec![lpr_hit(
             "2026-07-19T12:00:10Z",
             "ABC123",
             "ACCESS",
-            Some(("visitor", "17d2f099-99df-429b-becb-1399a6937e5a")),
+            Some(("visitor", visitor)),
             door,
         )];
         let (since, until) = lpr_window();
 
-        assert!(matches!(
+        assert_eq!(
             correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
-            LprCorrelation::Ambiguous { .. }
-        ));
+            LprCorrelation::Match(LprIdentityMatch {
+                actor_type: "visitor".into(),
+                actor_id: visitor.into(),
+                plate: "ABC123".into(),
+                timestamp: Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 10).unwrap(),
+            })
+        );
     }
 
     #[test]

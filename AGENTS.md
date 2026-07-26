@@ -65,6 +65,10 @@ recurring Visitors so they can pass the Entry Gate.
 - `fcr-rfid-encoder` — long-running R700 encoder, assignment UI, health endpoint,
   optional UniFi-authorized Entry Gate trigger, and multi-visit discovery of
   existing non-default vehicle tags.
+  - `discovery-status` reports retained tag-to-plate evidence. Visitor-backed
+    candidates remain `needs-resident`.
+  - `associate-discovered TAG_KEY UNIFI_USER_ID` validates a proposed permanent
+    owner without writing; `--apply` stores the local association.
 
 ## Conventions / gotchas
 

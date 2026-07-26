@@ -165,11 +165,19 @@ RFID_STATE_DB=/data/fcr-gate/rfid-encoder.sqlite3 \
   /data/fcr-gate/bin/fcr-rfid-encoder status
 RFID_STATE_DB=/data/fcr-gate/rfid-encoder.sqlite3 \
   /data/fcr-gate/bin/fcr-rfid-encoder gate-events --limit 50
+RFID_STATE_DB=/data/fcr-gate/rfid-encoder.sqlite3 \
+  /data/fcr-gate/bin/fcr-rfid-encoder discovery-status --limit 100
 curl --fail-with-body http://127.0.0.1:8080/healthz
 ```
 
 The health response contains service, reader, and database status only. It never
 includes tags, users, vehicles, or credentials.
+
+Successful UniFi LPR Visitor events can build durable tag-to-plate evidence, but
+they never become gate owners automatically. A mature `needs-resident` candidate
+must be validated against a permanent UniFi user with `associate-discovered`; the
+command is dry-run unless `--apply` is supplied. See
+[Gateway services](docs/gateway-services.md#multi-visit-discovery-for-existing-vehicle-tags).
 
 ## Development checks
 

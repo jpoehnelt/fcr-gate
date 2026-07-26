@@ -9,6 +9,9 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
+type DiscoveryIdentityKey = (String, String, String);
+type DiscoveryEvidence = (u32, HashSet<i64>, i64);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Encoding {
     pub sequence: u32,
@@ -75,7 +78,8 @@ pub struct DiscoveryCandidate {
     pub tid: Option<String>,
     pub epc: String,
     pub plate: String,
-    pub unifi_user_id: String,
+    pub lpr_actor_type: String,
+    pub lpr_actor_id: String,
     pub matched_occurrences: u32,
     pub distinct_days: u32,
     pub total_passages: u32,
@@ -90,6 +94,8 @@ pub struct DiscoveryCandidate {
 pub struct LearnedTagAssignment {
     pub owner: TagOwner,
     pub plate: String,
+    pub lpr_actor_type: String,
+    pub lpr_actor_id: String,
     pub status: String,
     pub lease_expires_ms: i64,
 }
@@ -206,7 +212,9 @@ impl Store {
                  ),
                  lpr_event_ms INTEGER,
                  plate TEXT,
-                 unifi_user_id TEXT
+                 lpr_actor_id TEXT,
+                 lpr_actor_type TEXT NOT NULL DEFAULT 'user'
+                     CHECK (lpr_actor_type IN ('user', 'visitor'))
              );
              CREATE INDEX IF NOT EXISTS discovery_passages_tag_time
                  ON discovery_passages(tag_key, started_at_ms DESC);
@@ -220,7 +228,10 @@ impl Store {
                  assigned_at TEXT NOT NULL,
                  assigned_by TEXT NOT NULL,
                  lease_expires_ms INTEGER NOT NULL,
-                 updated_at TEXT NOT NULL
+                 updated_at TEXT NOT NULL,
+                 lpr_actor_type TEXT NOT NULL DEFAULT 'user'
+                     CHECK (lpr_actor_type IN ('user', 'visitor')),
+                 lpr_actor_id TEXT
              );
              CREATE INDEX IF NOT EXISTS learned_tag_ownership_user
                  ON learned_tag_ownership(unifi_user_id, status);
@@ -242,6 +253,7 @@ impl Store {
                  ON gate_events(timestamp DESC);",
         )?;
         ensure_gate_event_mode(&connection)?;
+        ensure_lpr_actor_columns(&connection)?;
         Ok(Self {
             connection,
             actor: actor.into(),
@@ -566,7 +578,8 @@ impl Store {
     pub fn mark_discovery_passage_ambiguous(&mut self, passage_id: i64) -> Result<bool> {
         let changed = self.connection.execute(
             "UPDATE discovery_passages SET correlation_status = 'ambiguous',
-                 lpr_event_ms = NULL, plate = NULL, unifi_user_id = NULL
+                 lpr_event_ms = NULL, plate = NULL, lpr_actor_id = NULL,
+                 lpr_actor_type = 'user'
              WHERE id = ?1 AND correlation_status IN ('pending', 'matched')",
             [passage_id],
         )?;
@@ -578,42 +591,62 @@ impl Store {
         passage_id: i64,
         lpr_event_ms: i64,
         plate: &str,
-        unifi_user_id: &str,
+        lpr_actor_type: &str,
+        lpr_actor_id: &str,
     ) -> Result<PassageMatchOutcome> {
         validate_text(plate, 64, "license plate")?;
-        validate_text(unifi_user_id, 128, "UniFi user ID")?;
+        validate_lpr_actor_type(lpr_actor_type)?;
+        validate_text(lpr_actor_id, 128, "UniFi LPR actor ID")?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: (String, Option<i64>, Option<String>, Option<String>) = transaction
+        let existing: (String, Option<i64>, Option<String>, Option<String>, String) = transaction
             .query_row(
-                "SELECT correlation_status, lpr_event_ms, plate, unifi_user_id
+                "SELECT correlation_status, lpr_event_ms, plate, lpr_actor_id,
+                        lpr_actor_type
                  FROM discovery_passages WHERE id = ?1 AND stationary = 0",
                 [passage_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .with_context(|| format!("unknown or stationary discovery passage {passage_id}"))?;
         let outcome = match existing.0.as_str() {
             "pending" => {
                 transaction.execute(
                     "UPDATE discovery_passages SET correlation_status = 'matched',
-                         lpr_event_ms = ?1, plate = ?2, unifi_user_id = ?3
-                     WHERE id = ?4",
-                    params![lpr_event_ms, plate, unifi_user_id, passage_id],
+                         lpr_event_ms = ?1, plate = ?2, lpr_actor_id = ?3,
+                         lpr_actor_type = ?4
+                     WHERE id = ?5",
+                    params![
+                        lpr_event_ms,
+                        plate,
+                        lpr_actor_id,
+                        lpr_actor_type,
+                        passage_id
+                    ],
                 )?;
                 PassageMatchOutcome::Recorded
             }
             "matched"
                 if existing.1 == Some(lpr_event_ms)
                     && existing.2.as_deref() == Some(plate)
-                    && existing.3.as_deref() == Some(unifi_user_id) =>
+                    && existing.3.as_deref() == Some(lpr_actor_id)
+                    && existing.4 == lpr_actor_type =>
             {
                 PassageMatchOutcome::Duplicate
             }
             "matched" => {
                 transaction.execute(
                     "UPDATE discovery_passages SET correlation_status = 'ambiguous',
-                         lpr_event_ms = NULL, plate = NULL, unifi_user_id = NULL
+                         lpr_event_ms = NULL, plate = NULL, lpr_actor_id = NULL,
+                         lpr_actor_type = 'user'
                      WHERE id = ?1",
                     [passage_id],
                 )?;
@@ -660,7 +693,8 @@ impl Store {
             .unwrap_or(false);
         let cutoff = now_ms().saturating_sub(duration_ms(evidence_retention));
         let mut statement = self.connection.prepare(
-            "SELECT correlation_status, lpr_event_ms, plate, unifi_user_id
+            "SELECT correlation_status, lpr_event_ms, plate, lpr_actor_id,
+                    lpr_actor_type
              FROM discovery_passages
              WHERE tag_key = ?1 AND started_at_ms >= ?2 AND stationary = 0",
         )?;
@@ -670,6 +704,7 @@ impl Store {
                 row.get::<_, Option<i64>>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
         let passages = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -679,16 +714,16 @@ impl Store {
             return Ok(None);
         }
 
-        let mut groups: HashMap<(String, String), (u32, HashSet<i64>, i64)> = HashMap::new();
-        for (status, event_ms, plate, user_id) in passages {
+        let mut groups: HashMap<DiscoveryIdentityKey, DiscoveryEvidence> = HashMap::new();
+        for (status, event_ms, plate, actor_id, actor_type) in passages {
             if status != "matched" {
                 continue;
             }
-            let (Some(event_ms), Some(plate), Some(user_id)) = (event_ms, plate, user_id) else {
+            let (Some(event_ms), Some(plate), Some(actor_id)) = (event_ms, plate, actor_id) else {
                 continue;
             };
             let entry = groups
-                .entry((plate, user_id))
+                .entry((plate, actor_type, actor_id))
                 .or_insert_with(|| (0, HashSet::new(), event_ms));
             entry.0 = entry.0.saturating_add(1);
             entry.1.insert(event_ms.div_euclid(86_400_000));
@@ -706,7 +741,8 @@ impl Store {
                 .then_with(|| right.1.2.cmp(&left.1.2))
                 .then_with(|| left.0.cmp(&right.0))
         });
-        let ((plate, unifi_user_id), (matched_occurrences, days, last_match_ms)) = ranked.remove(0);
+        let ((plate, lpr_actor_type, lpr_actor_id), (matched_occurrences, days, last_match_ms)) =
+            ranked.remove(0);
         let conflicting_occurrences = ranked
             .iter()
             .map(|(_, (count, _, _))| *count)
@@ -738,7 +774,8 @@ impl Store {
             tid,
             epc,
             plate,
-            unifi_user_id,
+            lpr_actor_type,
+            lpr_actor_id,
             matched_occurrences,
             distinct_days,
             total_passages,
@@ -787,7 +824,8 @@ impl Store {
         self.connection
             .query_row(
                 "SELECT unifi_user_id, unifi_user_name, vehicle_description,
-                        assigned_at, assigned_by, plate, status, lease_expires_ms
+                        assigned_at, assigned_by, plate, lpr_actor_type,
+                        lpr_actor_id, status, lease_expires_ms
                  FROM learned_tag_ownership WHERE tag_key = ?1",
                 [tag_key],
                 |row| {
@@ -800,8 +838,10 @@ impl Store {
                             assigned_by: row.get(4)?,
                         },
                         plate: row.get(5)?,
-                        status: row.get(6)?,
-                        lease_expires_ms: row.get(7)?,
+                        lpr_actor_type: row.get(6)?,
+                        lpr_actor_id: row.get(7)?,
+                        status: row.get(8)?,
+                        lease_expires_ms: row.get(9)?,
                     })
                 },
             )
@@ -824,9 +864,11 @@ impl Store {
     pub fn activate_discovered_tag(
         &mut self,
         candidate: &DiscoveryCandidate,
+        unifi_user_id: &str,
         unifi_user_name: &str,
         lease: Duration,
     ) -> Result<TagOwner> {
+        validate_text(unifi_user_id, 128, "UniFi user ID")?;
         validate_text(unifi_user_name, 200, "UniFi user name")?;
         let transaction = self
             .connection
@@ -839,16 +881,28 @@ impl Store {
         if !exists {
             bail!("unknown discovered tag {}", candidate.tag_key);
         }
-        let existing: Option<(String, String, String)> = transaction
+        let existing: Option<(String, String, String, String, String)> = transaction
             .query_row(
-                "SELECT status, unifi_user_id, plate
+                "SELECT status, unifi_user_id, plate, lpr_actor_type, lpr_actor_id
                  FROM learned_tag_ownership WHERE tag_key = ?1",
                 [&candidate.tag_key],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        if let Some((status, user_id, plate)) = existing {
-            if status == "active" && user_id == candidate.unifi_user_id && plate == candidate.plate
+        if let Some((status, user_id, plate, actor_type, actor_id)) = existing {
+            if status == "active"
+                && user_id == unifi_user_id
+                && plate == candidate.plate
+                && actor_type == candidate.lpr_actor_type
+                && actor_id == candidate.lpr_actor_id
             {
                 transaction.commit()?;
                 return self
@@ -866,24 +920,29 @@ impl Store {
         transaction.execute(
             "INSERT INTO learned_tag_ownership
                  (tag_key, unifi_user_id, unifi_user_name, plate, status,
-                  vehicle_description, assigned_at, assigned_by, lease_expires_ms, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?6)",
+                  vehicle_description, assigned_at, assigned_by, lease_expires_ms, updated_at,
+                  lpr_actor_type, lpr_actor_id)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?6, ?9, ?10)",
             params![
                 candidate.tag_key,
-                candidate.unifi_user_id,
+                unifi_user_id,
                 unifi_user_name,
                 candidate.plate,
                 vehicle,
                 now,
                 self.actor,
-                expires_ms
+                expires_ms,
+                candidate.lpr_actor_type,
+                candidate.lpr_actor_id,
             ],
         )?;
         let detail = serde_json::json!({
             "source": "multi-visit-lpr",
-            "unifi_user_id": candidate.unifi_user_id,
+            "unifi_user_id": unifi_user_id,
             "unifi_user_name": unifi_user_name,
             "plate": candidate.plate,
+            "lpr_actor_type": candidate.lpr_actor_type,
+            "lpr_actor_id": candidate.lpr_actor_id,
             "matched_occurrences": candidate.matched_occurrences,
             "distinct_days": candidate.distinct_days,
             "confidence_percent": candidate.confidence_percent,
@@ -906,7 +965,8 @@ impl Store {
     pub fn renew_discovered_lease(
         &mut self,
         tag_key: &str,
-        unifi_user_id: &str,
+        lpr_actor_type: &str,
+        lpr_actor_id: &str,
         plate: &str,
         lease: Duration,
     ) -> Result<bool> {
@@ -914,8 +974,15 @@ impl Store {
         let changed = self.connection.execute(
             "UPDATE learned_tag_ownership SET lease_expires_ms = ?1, updated_at = ?2
              WHERE tag_key = ?3 AND status = 'active'
-               AND unifi_user_id = ?4 AND plate = ?5",
-            params![expires_ms, timestamp(), tag_key, unifi_user_id, plate],
+               AND lpr_actor_type = ?4 AND lpr_actor_id = ?5 AND plate = ?6",
+            params![
+                expires_ms,
+                timestamp(),
+                tag_key,
+                lpr_actor_type,
+                lpr_actor_id,
+                plate
+            ],
         )?;
         Ok(changed > 0)
     }
@@ -923,7 +990,8 @@ impl Store {
     pub fn count_discovery_conflicts(
         &self,
         tag_key: &str,
-        unifi_user_id: &str,
+        lpr_actor_type: &str,
+        lpr_actor_id: &str,
         plate: &str,
         evidence_retention: Duration,
     ) -> Result<u32> {
@@ -932,8 +1000,8 @@ impl Store {
             "SELECT COUNT(*) FROM discovery_passages
              WHERE tag_key = ?1 AND started_at_ms >= ?2 AND stationary = 0
                AND correlation_status = 'matched'
-               AND (unifi_user_id != ?3 OR plate != ?4)",
-            params![tag_key, cutoff, unifi_user_id, plate],
+               AND (lpr_actor_type != ?3 OR lpr_actor_id != ?4 OR plate != ?5)",
+            params![tag_key, cutoff, lpr_actor_type, lpr_actor_id, plate],
             |row| row.get(0),
         )?;
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
@@ -1041,7 +1109,8 @@ impl Store {
         if changed > 0 {
             let detail = serde_json::json!({
                 "plate": candidate.plate,
-                "unifi_user_id": candidate.unifi_user_id,
+                "lpr_actor_type": candidate.lpr_actor_type,
+                "lpr_actor_id": candidate.lpr_actor_id,
                 "matched_occurrences": candidate.matched_occurrences,
                 "distinct_days": candidate.distinct_days,
                 "total_passages": candidate.total_passages,
@@ -1051,7 +1120,7 @@ impl Store {
             audit_tx(
                 &transaction,
                 &self.actor,
-                "discovery-candidate-dry-run",
+                "discovery-candidate-ready",
                 Some(&candidate.tag_key),
                 Some(&candidate.epc),
                 Some(&detail),
@@ -1582,12 +1651,78 @@ fn ensure_gate_event_mode(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_lpr_actor_columns(connection: &Connection) -> Result<()> {
+    let has_legacy_passage_user =
+        table_has_column(connection, "discovery_passages", "unifi_user_id")?;
+    if !table_has_column(connection, "discovery_passages", "lpr_actor_type")? {
+        connection.execute(
+            "ALTER TABLE discovery_passages
+             ADD COLUMN lpr_actor_type TEXT NOT NULL DEFAULT 'user'
+             CHECK (lpr_actor_type IN ('user', 'visitor'))",
+            [],
+        )?;
+    }
+    if !table_has_column(connection, "discovery_passages", "lpr_actor_id")? {
+        connection.execute(
+            "ALTER TABLE discovery_passages ADD COLUMN lpr_actor_id TEXT",
+            [],
+        )?;
+    }
+    if has_legacy_passage_user {
+        connection.execute(
+            "UPDATE discovery_passages
+             SET lpr_actor_id = unifi_user_id
+             WHERE lpr_actor_id IS NULL AND unifi_user_id IS NOT NULL",
+            [],
+        )?;
+    }
+    if !table_has_column(connection, "learned_tag_ownership", "lpr_actor_type")? {
+        connection.execute(
+            "ALTER TABLE learned_tag_ownership
+             ADD COLUMN lpr_actor_type TEXT NOT NULL DEFAULT 'user'
+             CHECK (lpr_actor_type IN ('user', 'visitor'))",
+            [],
+        )?;
+    }
+    if !table_has_column(connection, "learned_tag_ownership", "lpr_actor_id")? {
+        connection.execute(
+            "ALTER TABLE learned_tag_ownership ADD COLUMN lpr_actor_id TEXT",
+            [],
+        )?;
+    }
+    connection.execute(
+        "UPDATE learned_tag_ownership
+         SET lpr_actor_id = unifi_user_id
+         WHERE lpr_actor_id IS NULL OR lpr_actor_id = ''",
+        [],
+    )?;
+    Ok(())
+}
+
+fn table_has_column(connection: &Connection, table: &str, expected: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn validate_text(value: &str, max_length: usize, name: &str) -> Result<()> {
     let value = value.trim();
     if value.is_empty() || value.len() > max_length || value.chars().any(char::is_control) {
         bail!("{name} must contain 1 to {max_length} printable characters");
     }
     Ok(())
+}
+
+fn validate_lpr_actor_type(value: &str) -> Result<()> {
+    if matches!(value, "user" | "visitor") {
+        return Ok(());
+    }
+    bail!("UniFi LPR actor type must be user or visitor")
 }
 
 fn validate_hex(value: &str, name: &str) -> Result<()> {
@@ -1957,6 +2092,7 @@ mod tests {
                     first.passage_id,
                     base + 500,
                     "ABC123",
+                    "user",
                     "17d2f099-99df-429b-becb-1399a6937e5a",
                 )
                 .unwrap(),
@@ -1968,6 +2104,7 @@ mod tests {
                     first.passage_id,
                     base + 500,
                     "ABC123",
+                    "user",
                     "17d2f099-99df-429b-becb-1399a6937e5a",
                 )
                 .unwrap(),
@@ -1996,7 +2133,7 @@ mod tests {
             let passage = discovery_seen(&mut store, tag, epc, at);
             if index < 3 {
                 store
-                    .record_discovery_match(passage.passage_id, at, "ABC123", user)
+                    .record_discovery_match(passage.passage_id, at, "ABC123", "user", user)
                     .unwrap();
             }
         }
@@ -2010,7 +2147,7 @@ mod tests {
         let fifth_at = base + 4 * 86_400_000;
         let fifth = discovery_seen(&mut store, tag, epc, fifth_at);
         store
-            .record_discovery_match(fifth.passage_id, fifth_at, "ABC123", user)
+            .record_discovery_match(fifth.passage_id, fifth_at, "ABC123", "user", user)
             .unwrap();
         let ready = store
             .discovery_candidate(tag, Duration::from_secs(60 * 86_400), 3, 2, 80, 2)
@@ -2029,6 +2166,7 @@ mod tests {
                     passage.passage_id,
                     at,
                     "XYZ789",
+                    "user",
                     "27d2f099-99df-429b-becb-1399a6937e5b",
                 )
                 .unwrap();
@@ -2054,6 +2192,7 @@ mod tests {
                 passage.passage_id,
                 base,
                 "ABC123",
+                "user",
                 "17d2f099-99df-429b-becb-1399a6937e5a",
             )
             .unwrap();
@@ -2063,6 +2202,7 @@ mod tests {
                     passage.passage_id,
                     base + 1_000,
                     "XYZ789",
+                    "user",
                     "27d2f099-99df-429b-becb-1399a6937e5b",
                 )
                 .unwrap(),
@@ -2118,14 +2258,14 @@ mod tests {
         let at = now_ms() - 1_000;
         let passage = discovery_seen(&mut store, tag, epc, at);
         store
-            .record_discovery_match(passage.passage_id, at, "ABC123", user)
+            .record_discovery_match(passage.passage_id, at, "ABC123", "user", user)
             .unwrap();
         let candidate = store
             .discovery_candidate(tag, Duration::from_secs(60 * 86_400), 1, 1, 100, 2)
             .unwrap()
             .unwrap();
         store
-            .activate_discovered_tag(&candidate, "Example User", Duration::from_secs(60))
+            .activate_discovered_tag(&candidate, user, "Example User", Duration::from_secs(60))
             .unwrap();
         assert_eq!(
             store.get_gate_owner(tag).unwrap().unwrap().unifi_user_id,
@@ -2133,7 +2273,7 @@ mod tests {
         );
         assert!(
             store
-                .renew_discovered_lease(tag, user, "ABC123", Duration::from_secs(120))
+                .renew_discovered_lease(tag, "user", user, "ABC123", Duration::from_secs(120),)
                 .unwrap()
         );
         assert!(
@@ -2148,20 +2288,109 @@ mod tests {
         let relearned_at = now_ms();
         let relearned = discovery_seen(&mut store, tag, epc, relearned_at);
         store
-            .record_discovery_match(relearned.passage_id, relearned_at, "ABC123", user)
+            .record_discovery_match(relearned.passage_id, relearned_at, "ABC123", "user", user)
             .unwrap();
         let candidate = store
             .discovery_candidate(tag, Duration::from_secs(60 * 86_400), 1, 1, 100, 2)
             .unwrap()
             .unwrap();
         store
-            .activate_discovered_tag(&candidate, "Example User", Duration::from_secs(60))
+            .activate_discovered_tag(&candidate, user, "Example User", Duration::from_secs(60))
             .unwrap();
         store.revoke_discovered_tag(tag).unwrap();
         assert_eq!(
             store.learned_assignment(tag).unwrap().unwrap().status,
             "revoked"
         );
+    }
+
+    #[test]
+    fn visitor_evidence_can_be_manually_associated_without_becoming_the_gate_owner() {
+        let directory = tempdir().unwrap();
+        let mut store = Store::open(&directory.path().join("state.sqlite3"), "manual-cli").unwrap();
+        let tag = "E2802222";
+        let epc = "21223344556677889900AABB";
+        let visitor = "27d2f099-99df-429b-becb-1399a6937e5b";
+        let user = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let at = now_ms() - 1_000;
+        let passage = discovery_seen(&mut store, tag, epc, at);
+        store
+            .record_discovery_match(passage.passage_id, at, "ABC123", "visitor", visitor)
+            .unwrap();
+        let candidate = store
+            .discovery_candidate(tag, Duration::from_secs(60 * 86_400), 1, 1, 100, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.lpr_actor_type, "visitor");
+        assert_eq!(candidate.lpr_actor_id, visitor);
+        assert!(candidate.ready);
+
+        store
+            .activate_discovered_tag(&candidate, user, "Example User", Duration::from_secs(60))
+            .unwrap();
+        let assignment = store.learned_assignment(tag).unwrap().unwrap();
+        assert_eq!(assignment.owner.unifi_user_id, user);
+        assert_eq!(assignment.lpr_actor_type, "visitor");
+        assert_eq!(assignment.lpr_actor_id, visitor);
+        assert!(
+            store
+                .renew_discovered_lease(
+                    tag,
+                    "visitor",
+                    visitor,
+                    "ABC123",
+                    Duration::from_secs(120),
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .renew_discovered_lease(tag, "user", user, "ABC123", Duration::from_secs(120),)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_discovery_rows_gain_user_actor_metadata() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE discovery_passages (
+                    id INTEGER PRIMARY KEY,
+                    unifi_user_id TEXT
+                );
+                CREATE TABLE learned_tag_ownership (
+                    tag_key TEXT PRIMARY KEY,
+                    unifi_user_id TEXT NOT NULL
+                );
+                INSERT INTO discovery_passages (id, unifi_user_id)
+                VALUES (1, '17d2f099-99df-429b-becb-1399a6937e5a');
+                INSERT INTO learned_tag_ownership (tag_key, unifi_user_id)
+                VALUES ('E2801111', '17d2f099-99df-429b-becb-1399a6937e5a');",
+            )
+            .unwrap();
+
+        ensure_lpr_actor_columns(&connection).unwrap();
+
+        let migrated: (String, String) = connection
+            .query_row(
+                "SELECT lpr_actor_type, lpr_actor_id FROM learned_tag_ownership",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            migrated,
+            ("user".into(), "17d2f099-99df-429b-becb-1399a6937e5a".into())
+        );
+        let passage: (String, String) = connection
+            .query_row(
+                "SELECT lpr_actor_type, lpr_actor_id FROM discovery_passages",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(passage, migrated);
     }
 
     #[test]
