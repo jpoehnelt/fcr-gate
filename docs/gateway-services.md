@@ -130,8 +130,10 @@ one completed tag that has never been assigned, then reads a short window of
 Entry Gate `LICENSEPLATE` logs. A match requires exactly one plate and one distinct
 successful `ACCESS` user/plate pair whose actor type is `user`, plus an active user
 and an Entry Gate access policy. Repeated reads of that same pair are harmless.
-Visitor events, blocked-only reads, another plate, another unassigned tag,
-truncated logs, or malformed data do not create an assignment.
+Visitor events do not directly assign a newly encoded tag to a permanent user.
+They remain available to multi-visit discovery instead. Blocked-only reads,
+another plate, another unassigned tag, truncated logs, or malformed data do not
+create an assignment.
 
 Ambiguity advances a per-TID cutoff in SQLite, so an old event cannot become a
 match merely because other activity ages out of the window or the service
@@ -155,9 +157,12 @@ candidates require at least five matches even when
 Each period of continuous RFID visibility is one passage. Repeated inventory reads
 and repeated queries of the same UniFi LPR event cannot add votes. A passage is
 credited only when its short matching window contains one distinct successful
-permanent-user plate identity. Unmatched and ambiguous passages remain evidence
-against confidence rather than disappearing. The matching window is anchored to
-the R700 event timestamp, so delayed buffered reads cannot match a current vehicle.
+plate identity. UniFi may identify that actor as either a permanent `user` or a
+temporary `visitor`; the actor type and ID are retained with the plate so they
+cannot be conflated. Unmatched and ambiguous passages remain evidence against
+confidence rather than disappearing. Blocked plate reads never count as a match.
+The matching window is anchored to the R700 event timestamp, so delayed buffered
+reads cannot match a current vehicle.
 
 The defaults activate a TID candidate after at least three matching passages on
 two distinct UTC days, at least 80 percent of all retained non-stationary passages
@@ -166,12 +171,19 @@ pair. Multiple tags in one vehicle can independently learn the same plate. A tag
 that remains continuously visible beyond `RFID_DISCOVERY_MAX_DWELL_MS` is treated
 as stationary and cannot qualify.
 
+User-backed candidates can activate automatically in live mode after the current
+UniFi user and Entry Gate policy are validated. Visitor-backed candidates stop at
+`needs-resident`: the visitor proves a durable tag-to-plate relationship but is not
+treated as the permanent gate owner. An administrator must explicitly associate a
+mature candidate with an active permanent user who has Entry Gate access. The
+command is dry-run by default and requires `--apply` to write the local association.
+
 Live learned assignments are renewable 60-day leases. A later successful LPR
-passage for the same user and plate renews the lease; repeated evidence for another
-vehicle or a long-dwell tag suspends it. Dry-run records observations and candidate
-audits but never activates, renews, or suspends an assignment. Existing learned
-tags still undergo the normal live UniFi status, policy, and schedule checks before
-an RFID-only unlock.
+passage for the same source actor and plate renews the lease; repeated evidence for
+another vehicle or a long-dwell tag suspends it. Dry-run records observations and
+candidate audits but never activates, renews, or suspends an assignment. Existing
+learned tags still undergo the normal live UniFi status, policy, and schedule
+checks before an RFID-only unlock.
 
 Review candidates and revoke a learned assignment from the gateway with:
 
@@ -180,6 +192,11 @@ set -a
 . /data/fcr-gate/secrets/gateway.env
 set +a
 /data/fcr-gate/bin/fcr-rfid-encoder discovery-status --limit 100
+/data/fcr-gate/bin/fcr-rfid-encoder associate-discovered \
+  TID_OR_EPC_KEY UNIFI_USER_ID --dry-run
+# After reviewing the validated plan:
+/data/fcr-gate/bin/fcr-rfid-encoder associate-discovered \
+  TID_OR_EPC_KEY UNIFI_USER_ID --apply
 /data/fcr-gate/bin/fcr-rfid-encoder revoke-learned TID_OR_EPC_KEY
 /data/fcr-gate/bin/fcr-rfid-encoder reset-learned SUSPENDED_TID_OR_EPC_KEY
 ```
