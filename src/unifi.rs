@@ -873,6 +873,54 @@ mod tests {
     }
 
     #[test]
+    fn unknown_lpr_actor_type_is_ambiguous() {
+        let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let actor = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let hits = vec![lpr_hit(
+            "2026-07-19T12:00:10Z",
+            "ABC123",
+            "ACCESS",
+            Some(("device", actor)),
+            door,
+        )];
+        let (since, until) = lpr_window();
+
+        assert!(matches!(
+            correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
+            LprCorrelation::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
+    fn user_and_visitor_for_the_same_plate_are_ambiguous() {
+        let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let user = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let visitor = "27d2f099-99df-429b-becb-1399a6937e5b";
+        let hits = vec![
+            lpr_hit(
+                "2026-07-19T12:00:10Z",
+                "ABC123",
+                "ACCESS",
+                Some(("user", user)),
+                door,
+            ),
+            lpr_hit(
+                "2026-07-19T12:00:11Z",
+                "ABC123",
+                "ACCESS",
+                Some(("visitor", visitor)),
+                door,
+            ),
+        ];
+        let (since, until) = lpr_window();
+
+        assert!(matches!(
+            correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
+            LprCorrelation::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
     fn two_users_for_the_same_plate_are_ambiguous() {
         let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
         let first = "17d2f099-99df-429b-becb-1399a6937e5a";

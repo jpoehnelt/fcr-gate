@@ -192,7 +192,8 @@ set -a
 . /data/fcr-gate/secrets/gateway.env
 set +a
 /data/fcr-gate/bin/fcr-rfid-encoder discovery-status --limit 100
-/data/fcr-gate/bin/fcr-rfid-encoder associate-discovered TID_OR_EPC_KEY UNIFI_USER_ID
+/data/fcr-gate/bin/fcr-rfid-encoder associate-discovered \
+  TID_OR_EPC_KEY UNIFI_USER_ID --dry-run
 # After reviewing the validated plan:
 /data/fcr-gate/bin/fcr-rfid-encoder associate-discovered \
   TID_OR_EPC_KEY UNIFI_USER_ID --apply

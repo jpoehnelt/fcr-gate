@@ -51,6 +51,9 @@ enum Command {
     AssociateDiscovered {
         tag_key: String,
         unifi_user_id: String,
+        /// Print the validated plan without writing. This is the default.
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
         /// Persist the association. Without this flag, only print the validated plan.
         #[arg(long)]
         apply: bool,
@@ -93,6 +96,7 @@ async fn main() -> Result<()> {
         Command::AssociateDiscovered {
             tag_key,
             unifi_user_id,
+            dry_run: _,
             apply,
         } => associate_discovered(&tag_key, &unifi_user_id, apply).await,
         Command::RevokeLearned { tag_key } => revoke_learned(&tag_key),
@@ -737,7 +741,7 @@ async fn maybe_correlate_lpr(
                 store.record_lpr_correlation_audit(
                     &observation.tid,
                     &observation.epc,
-                    "lpr-correlation-ambiguous",
+                    "lpr-correlation-visitor",
                     &detail,
                 )?;
                 info!(
@@ -1026,9 +1030,19 @@ fn print_discovery_candidate(candidate: &DiscoveryCandidate) {
 }
 
 async fn associate_discovered(tag_key: &str, unifi_user_id: &str, apply: bool) -> Result<()> {
-    let tag_key = normalize_discovery_key(tag_key)?;
     let config = Config::from_env()?;
     let mut store = Store::open(&config.state_db, "manual-cli")?;
+    associate_discovered_with(&config, &mut store, tag_key, unifi_user_id, apply).await
+}
+
+async fn associate_discovered_with(
+    config: &Config,
+    store: &mut Store,
+    tag_key: &str,
+    unifi_user_id: &str,
+    apply: bool,
+) -> Result<()> {
+    let tag_key = normalize_discovery_key(tag_key)?;
     let candidate = store
         .discovery_candidate(
             &tag_key,
@@ -1039,7 +1053,12 @@ async fn associate_discovered(tag_key: &str, unifi_user_id: &str, apply: bool) -
             config.discovery_conflict_occurrences,
         )?
         .with_context(|| format!("discovered tag {tag_key} has no correlated LPR evidence"))?;
-    if !candidate.ready {
+    let minimum_occurrences = if candidate.identity_kind == "epc" {
+        config.discovery_min_occurrences.max(5)
+    } else {
+        config.discovery_min_occurrences
+    };
+    if !candidate.ready || candidate.matched_occurrences < minimum_occurrences {
         anyhow::bail!(
             "discovered tag {tag_key} has not met the configured occurrence, day, confidence, and conflict thresholds"
         );
@@ -1050,7 +1069,7 @@ async fn associate_discovered(tag_key: &str, unifi_user_id: &str, apply: bool) -
             candidate.lpr_actor_type
         );
     }
-    let unifi = UnifiClient::new(&config)?;
+    let unifi = UnifiClient::new(config)?;
     let user = unifi.validate_claim_user(unifi_user_id).await?;
     println!(
         "{}: tag {} / EPC {} / plate {} / visitor {} -> user {} ({})",
@@ -1382,6 +1401,64 @@ mod tests {
         })
     }
 
+    fn record_ready_discovery_candidate(
+        store: &mut Store,
+        tag_key: &str,
+        identity_kind: &'static str,
+        epc: &str,
+        actor_type: &str,
+        actor_id: &str,
+    ) {
+        let at = now_ms() - 1_000;
+        let seen = store
+            .record_discovery_seen(
+                tag_key,
+                identity_kind,
+                (identity_kind == "tid").then_some(tag_key),
+                epc,
+                -4200,
+                at,
+                Duration::from_secs(30),
+                Duration::from_secs(120),
+                Duration::from_secs(60 * 86_400),
+            )
+            .unwrap();
+        store
+            .record_discovery_match(seen.passage_id, at, "ABC123", actor_type, actor_id)
+            .unwrap();
+    }
+
+    #[test]
+    fn associate_discovered_accepts_explicit_dry_run_and_rejects_both_modes() {
+        let dry_run = Cli::try_parse_from([
+            "fcr-rfid-encoder",
+            "associate-discovered",
+            "E2801111",
+            USER_ID,
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(matches!(
+            dry_run.command,
+            Some(Command::AssociateDiscovered {
+                dry_run: true,
+                apply: false,
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "fcr-rfid-encoder",
+                "associate-discovered",
+                "E2801111",
+                USER_ID,
+                "--dry-run",
+                "--apply",
+            ])
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn dry_run_evaluates_every_policy_layer_without_unlocking() {
         let (base_url, counts, server) = mock_unifi(true).await;
@@ -1709,6 +1786,86 @@ mod tests {
         );
         assert_eq!(counts.user_reads.load(Ordering::SeqCst), 0);
         assert_eq!(counts.unlocks.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn associate_discovered_dry_run_does_not_write_and_apply_assigns_the_user() {
+        let (base_url, counts, server) = mock_unifi(true).await;
+        let directory = tempdir().unwrap();
+        let db = directory.path().join("state.sqlite3");
+        let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
+        config.discovery_min_occurrences = 1;
+        config.discovery_min_days = 1;
+        config.discovery_min_confidence_percent = 100;
+        let visitor_id = "27d2f099-99df-429b-becb-1399a6937e5b";
+        let mut store = Store::open(&db, "manual-cli").unwrap();
+        record_ready_discovery_candidate(
+            &mut store,
+            "E280AAAC",
+            "tid",
+            "A3223344556677889900AABB",
+            "visitor",
+            visitor_id,
+        );
+
+        associate_discovered_with(&config, &mut store, "E280AAAC", USER_ID, false)
+            .await
+            .unwrap();
+        assert!(store.learned_assignment("E280AAAC").unwrap().is_none());
+
+        associate_discovered_with(&config, &mut store, "E280AAAC", USER_ID, true)
+            .await
+            .unwrap();
+        let assignment = store.learned_assignment("E280AAAC").unwrap().unwrap();
+        assert_eq!(assignment.owner.unifi_user_id, USER_ID);
+        assert_eq!(assignment.lpr_actor_type, "visitor");
+        assert_eq!(assignment.lpr_actor_id, visitor_id);
+        assert_eq!(counts.user_reads.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.unlocks.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn associate_discovered_rejects_user_backed_and_weak_epc_candidates() {
+        let (base_url, counts, server) = mock_unifi(true).await;
+        let directory = tempdir().unwrap();
+        let db = directory.path().join("state.sqlite3");
+        let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
+        config.discovery_min_occurrences = 1;
+        config.discovery_min_days = 1;
+        config.discovery_min_confidence_percent = 100;
+        let visitor_id = "27d2f099-99df-429b-becb-1399a6937e5b";
+        let mut store = Store::open(&db, "manual-cli").unwrap();
+        record_ready_discovery_candidate(
+            &mut store,
+            "E280AAAD",
+            "tid",
+            "A4223344556677889900AABB",
+            "user",
+            USER_ID,
+        );
+        let user_error = associate_discovered_with(&config, &mut store, "E280AAAD", USER_ID, false)
+            .await
+            .unwrap_err();
+        assert!(
+            user_error
+                .to_string()
+                .contains("does not require visitor association")
+        );
+
+        let epc = "A5223344556677889900AABB";
+        let epc_key = format!("EPC:{epc}");
+        record_ready_discovery_candidate(&mut store, &epc_key, "epc", epc, "visitor", visitor_id);
+        let epc_error = associate_discovered_with(&config, &mut store, &epc_key, USER_ID, false)
+            .await
+            .unwrap_err();
+        assert!(
+            epc_error
+                .to_string()
+                .contains("has not met the configured occurrence")
+        );
+        assert_eq!(counts.user_reads.load(Ordering::SeqCst), 0);
         server.abort();
     }
 

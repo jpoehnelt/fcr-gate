@@ -398,7 +398,7 @@ impl Store {
     ) -> Result<()> {
         if !matches!(
             kind,
-            "lpr-correlation-dry-run" | "lpr-correlation-ambiguous"
+            "lpr-correlation-dry-run" | "lpr-correlation-ambiguous" | "lpr-correlation-visitor"
         ) {
             bail!("invalid LPR correlation audit kind {kind}");
         }
@@ -1000,7 +1000,7 @@ impl Store {
             "SELECT COUNT(*) FROM discovery_passages
              WHERE tag_key = ?1 AND started_at_ms >= ?2 AND stationary = 0
                AND correlation_status = 'matched'
-               AND (lpr_actor_type != ?3 OR lpr_actor_id != ?4 OR plate != ?5)",
+               AND (lpr_actor_type IS NOT ?3 OR lpr_actor_id IS NOT ?4 OR plate IS NOT ?5)",
             params![tag_key, cutoff, lpr_actor_type, lpr_actor_id, plate],
             |row| row.get(0),
         )?;
@@ -2347,6 +2347,39 @@ mod tests {
             !store
                 .renew_discovered_lease(tag, "user", user, "ABC123", Duration::from_secs(120),)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn matched_passage_with_null_identity_counts_as_conflicting_evidence() {
+        let directory = tempdir().unwrap();
+        let mut store = Store::open(&directory.path().join("state.sqlite3"), "test").unwrap();
+        let tag = "E2803333";
+        let epc = "31223344556677889900AABB";
+        let at = now_ms() - 1_000;
+        let passage = discovery_seen(&mut store, tag, epc, at);
+        store
+            .connection
+            .execute(
+                "UPDATE discovery_passages
+                 SET correlation_status = 'matched', lpr_event_ms = ?1,
+                     plate = 'ABC123', lpr_actor_type = 'user', lpr_actor_id = NULL
+                 WHERE id = ?2",
+                params![at, passage.passage_id],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .count_discovery_conflicts(
+                    tag,
+                    "user",
+                    "17d2f099-99df-429b-becb-1399a6937e5a",
+                    "ABC123",
+                    Duration::from_secs(60 * 86_400),
+                )
+                .unwrap(),
+            1
         );
     }
 
