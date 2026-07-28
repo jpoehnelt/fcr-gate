@@ -164,6 +164,13 @@ confidence rather than disappearing. Blocked plate reads never count as a match.
 The matching window is anchored to the R700 event timestamp, so delayed buffered
 reads cannot match a current vehicle.
 
+UniFi Access can publish a successful LPR event to the system-log API after the
+RFID tag has left the reader field. Pending passages are therefore retried up to
+three times, beginning 15 seconds after the last tag report and then every 15
+seconds. On restart, the service also retries pending passages from the previous
+90 seconds. Every retry uses the original RFID timestamp and matching window, so
+a later vehicle cannot satisfy an older passage.
+
 The defaults activate a TID candidate after at least three matching passages on
 two distinct UTC days, at least 80 percent of all retained non-stationary passages
 matching the leading user/plate pair, and fewer than two matches for any competing
