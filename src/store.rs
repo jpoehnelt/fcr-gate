@@ -232,6 +232,8 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS discovery_passages_tag_time
                  ON discovery_passages(tag_key, started_at_ms DESC);
+             CREATE INDEX IF NOT EXISTS discovery_passages_pending_retry
+                 ON discovery_passages(correlation_status, stationary, last_seen_ms);
              CREATE TABLE IF NOT EXISTS learned_tag_ownership (
                  tag_key TEXT PRIMARY KEY REFERENCES discovery_tags(tag_key) ON DELETE CASCADE,
                  unifi_user_id TEXT NOT NULL,

@@ -91,7 +91,8 @@ const DISCOVERY_LPR_RETRY_DELAY: Duration = Duration::from_secs(15);
 const DISCOVERY_LPR_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const DISCOVERY_LPR_MAX_RETRIES: u8 = 3;
 const DISCOVERY_LPR_RETRY_HORIZON: Duration = Duration::from_secs(90);
-const DISCOVERY_LPR_RETRY_BATCH: usize = 100;
+const DISCOVERY_LPR_RETRY_PASS_TIMEOUT: Duration = Duration::from_secs(2);
+const DISCOVERY_LPR_RETRY_BATCH: usize = 20;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -209,10 +210,19 @@ async fn run() -> Result<()> {
                     warn!(%tid, "encoding transaction timed out and was released for retry");
                 }
                 if config.discovery_mode.enabled() {
-                    if let Err(error) =
-                        retry_pending_discovery_matches(&config, &mut gate, &mut store).await
+                    match tokio::time::timeout(
+                        DISCOVERY_LPR_RETRY_PASS_TIMEOUT,
+                        retry_pending_discovery_matches(&config, &mut gate, &mut store),
+                    )
+                    .await
                     {
-                        error!(%error, "failed to retry pending RFID/LPR discovery passages");
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            error!(%error, "failed to retry pending RFID/LPR discovery passages");
+                        }
+                        Err(_) => {
+                            warn!("paused delayed RFID/LPR retries to keep the reader loop responsive");
+                        }
                     }
                 }
             }
