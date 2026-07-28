@@ -11,7 +11,10 @@ use fcr_rfid_encoder::{
     engine::{Action, Engine},
     impinj::ImpinjClient,
     model::{DiscoveryObservation, ReaderEvent, TagObservation},
-    store::{DiscoveryCandidate, PassageMatchOutcome, Store, now_ms},
+    store::{
+        DiscoveryCandidate, DiscoverySeen, PassageMatchOutcome, PendingDiscoveryPassage, Store,
+        now_ms,
+    },
     unifi::{AuthorizationDecision, LprCorrelation, UnifiClient},
     web,
 };
@@ -69,7 +72,13 @@ struct GateRuntime {
     last_attempts: HashMap<String, Instant>,
     lpr_last_attempts: HashMap<String, Instant>,
     discovery_last_attempts: HashMap<String, Instant>,
+    discovery_retry_attempts: HashMap<i64, DiscoveryRetryState>,
     discovery_lpr_cache: Option<CachedDiscoveryLpr>,
+}
+
+struct DiscoveryRetryState {
+    attempts: u8,
+    last_attempt: Instant,
 }
 
 struct CachedDiscoveryLpr {
@@ -77,6 +86,13 @@ struct CachedDiscoveryLpr {
     observed_at_ms: i64,
     correlation: LprCorrelation,
 }
+
+const DISCOVERY_LPR_RETRY_DELAY: Duration = Duration::from_secs(15);
+const DISCOVERY_LPR_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+const DISCOVERY_LPR_MAX_RETRIES: u8 = 3;
+const DISCOVERY_LPR_RETRY_HORIZON: Duration = Duration::from_secs(90);
+const DISCOVERY_LPR_RETRY_PASS_TIMEOUT: Duration = Duration::from_secs(2);
+const DISCOVERY_LPR_RETRY_BATCH: usize = 20;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -142,6 +158,7 @@ async fn run() -> Result<()> {
         last_attempts: HashMap::new(),
         lpr_last_attempts: HashMap::new(),
         discovery_last_attempts: HashMap::new(),
+        discovery_retry_attempts: HashMap::new(),
         discovery_lpr_cache: None,
     };
     let mut timeout_check = tokio::time::interval(Duration::from_secs(1));
@@ -191,6 +208,22 @@ async fn run() -> Result<()> {
                         config.max_attempts,
                     )?;
                     warn!(%tid, "encoding transaction timed out and was released for retry");
+                }
+                if config.discovery_mode.enabled() {
+                    match tokio::time::timeout(
+                        DISCOVERY_LPR_RETRY_PASS_TIMEOUT,
+                        retry_pending_discovery_matches(&config, &mut gate, &mut store),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            error!(%error, "failed to retry pending RFID/LPR discovery passages");
+                        }
+                        Err(_) => {
+                            warn!("paused delayed RFID/LPR retries to keep the reader loop responsive");
+                        }
+                    }
                 }
             }
             event = receiver.recv() => {
@@ -406,13 +439,21 @@ async fn maybe_learn_discovered_tag(
         return Ok(());
     }
 
+    match_discovery_passage(config, gate, store, observation, &seen).await
+}
+
+async fn match_discovery_passage(
+    config: &Config,
+    gate: &mut GateRuntime,
+    store: &mut Store,
+    observation: &DiscoveryObservation,
+    seen: &DiscoverySeen,
+) -> Result<()> {
+    let attempt_time = Instant::now();
     let window_ms = i64::try_from(config.discovery_match_window.as_millis()).unwrap_or(i64::MAX);
-    let since_ms = observation.observed_at_ms.saturating_sub(window_ms);
+    let since_ms = seen.started_at_ms.saturating_sub(window_ms);
     let now_ms = Utc::now().timestamp_millis();
-    let until_ms = observation
-        .observed_at_ms
-        .saturating_add(window_ms)
-        .min(now_ms);
+    let until_ms = seen.last_seen_ms.saturating_add(window_ms).min(now_ms);
     let since = DateTime::<Utc>::from_timestamp_millis(since_ms)
         .context("discovery match window is outside the supported date range")?;
     let until = DateTime::<Utc>::from_timestamp_millis(until_ms)
@@ -429,7 +470,7 @@ async fn maybe_learn_discovered_tag(
             LprCorrelation::NoMatch | LprCorrelation::Ambiguous { .. } => true,
         };
         (attempt_time.duration_since(cached.fetched_at) < config.discovery_poll
-            && observation.observed_at_ms.abs_diff(cached.observed_at_ms)
+            && seen.last_seen_ms.abs_diff(cached.observed_at_ms)
                 <= u64::try_from(poll_ms).unwrap_or(u64::MAX)
             && timestamp_matches)
             .then(|| cached.correlation.clone())
@@ -445,7 +486,7 @@ async fn maybe_learn_discovered_tag(
             .await?;
         gate.discovery_lpr_cache = Some(CachedDiscoveryLpr {
             fetched_at: attempt_time,
-            observed_at_ms: observation.observed_at_ms,
+            observed_at_ms: seen.last_seen_ms,
             correlation: correlation.clone(),
         });
         correlation
@@ -654,6 +695,89 @@ async fn maybe_learn_discovered_tag(
         "activated existing RFID tag from multi-visit vehicle evidence"
     );
     Ok(())
+}
+
+async fn retry_pending_discovery_matches(
+    config: &Config,
+    gate: &mut GateRuntime,
+    store: &mut Store,
+) -> Result<()> {
+    let now_ms = Utc::now().timestamp_millis();
+    let retry_delay_ms = i64::try_from(DISCOVERY_LPR_RETRY_DELAY.as_millis()).unwrap_or(i64::MAX);
+    let retry_horizon_ms =
+        i64::try_from(DISCOVERY_LPR_RETRY_HORIZON.as_millis()).unwrap_or(i64::MAX);
+    let pending = store.pending_discovery_passages(
+        now_ms.saturating_sub(retry_delay_ms),
+        now_ms.saturating_sub(retry_horizon_ms),
+        DISCOVERY_LPR_RETRY_BATCH,
+    )?;
+    gate.discovery_retry_attempts
+        .retain(|_, state| state.last_attempt.elapsed() < DISCOVERY_LPR_RETRY_HORIZON);
+
+    for passage in pending {
+        let retry_due = gate
+            .discovery_retry_attempts
+            .get(&passage.passage_id)
+            .is_none_or(|state| {
+                state.attempts < DISCOVERY_LPR_MAX_RETRIES
+                    && state.last_attempt.elapsed() >= DISCOVERY_LPR_RETRY_INTERVAL
+            });
+        if !retry_due {
+            continue;
+        }
+        let attempts = gate
+            .discovery_retry_attempts
+            .get(&passage.passage_id)
+            .map_or(1, |state| state.attempts.saturating_add(1));
+        gate.discovery_retry_attempts.insert(
+            passage.passage_id,
+            DiscoveryRetryState {
+                attempts,
+                last_attempt: Instant::now(),
+            },
+        );
+
+        let observation = pending_discovery_observation(config, &passage);
+        let seen = DiscoverySeen {
+            passage_id: passage.passage_id,
+            started_at_ms: passage.started_at_ms,
+            last_seen_ms: passage.last_seen_ms,
+            correlation_status: "pending".into(),
+            long_dwell: false,
+            became_long_dwell: false,
+        };
+        if let Err(error) = match_discovery_passage(config, gate, store, &observation, &seen).await
+        {
+            warn!(
+                passage_id = passage.passage_id,
+                tag = %passage.tag_key,
+                attempt = attempts,
+                %error,
+                "delayed RFID/LPR discovery retry failed"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn pending_discovery_observation(
+    config: &Config,
+    passage: &PendingDiscoveryPassage,
+) -> DiscoveryObservation {
+    let identity_kind = match passage.identity_kind.as_str() {
+        "tid" => "tid",
+        "epc" => "epc",
+        _ => unreachable!("discovery identity kind is constrained by SQLite"),
+    };
+    DiscoveryObservation {
+        tag_key: passage.tag_key.clone(),
+        identity_kind,
+        tid: passage.tid.clone(),
+        epc: passage.epc.clone(),
+        antenna_port: config.antenna_port,
+        peak_rssi_cdbm: passage.peak_rssi_cdbm,
+        observed_at_ms: passage.last_seen_ms,
+    }
 }
 
 async fn maybe_correlate_lpr(
@@ -1472,6 +1596,7 @@ mod tests {
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
+            discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
         };
 
@@ -1500,6 +1625,7 @@ mod tests {
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
+            discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
         };
         maybe_unlock_gate_identity(
@@ -1531,6 +1657,7 @@ mod tests {
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
+            discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
         };
 
@@ -1577,6 +1704,7 @@ mod tests {
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
+            discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
         };
 
@@ -1607,6 +1735,7 @@ mod tests {
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
+            discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
         };
 
@@ -1648,6 +1777,7 @@ mod tests {
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
+            discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
         };
 
@@ -1699,6 +1829,7 @@ mod tests {
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
+            discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
         };
 
@@ -1757,6 +1888,7 @@ mod tests {
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
+            discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
         };
 
@@ -1786,6 +1918,95 @@ mod tests {
         );
         assert_eq!(counts.user_reads.load(Ordering::SeqCst), 0);
         assert_eq!(counts.unlocks.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delayed_retry_recovers_an_lpr_event_published_after_the_reader_event() {
+        let (base_url, counts, server) = mock_unifi(true).await;
+        let directory = tempdir().unwrap();
+        let db = directory.path().join("state.sqlite3");
+        let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
+        config.discovery_mode = LprCorrelationMode::DryRun;
+        config.discovery_min_occurrences = 1;
+        config.discovery_min_days = 1;
+        config.discovery_min_confidence_percent = 100;
+        config.discovery_poll = Duration::from_millis(1);
+        let visitor_id = "27d2f099-99df-429b-becb-1399a6937e5b";
+        let mut store = Store::open(&db, "gate-auto").unwrap();
+        let mut observation = discovered_tid("E280AAAF", "A6223344556677889900AABB");
+        observation.observed_at_ms =
+            now_ms() - i64::try_from(DISCOVERY_LPR_RETRY_DELAY.as_millis()).unwrap() - 1_000;
+        let mut gate = GateRuntime {
+            unifi: Some(UnifiClient::new(&config).unwrap()),
+            last_attempts: HashMap::new(),
+            lpr_last_attempts: HashMap::new(),
+            discovery_last_attempts: HashMap::new(),
+            discovery_retry_attempts: HashMap::new(),
+            discovery_lpr_cache: None,
+        };
+
+        maybe_learn_discovered_tag(&config, &mut gate, &mut store, &observation)
+            .await
+            .unwrap();
+        assert_eq!(counts.lpr_reads.load(Ordering::SeqCst), 1);
+        assert!(
+            store
+                .discovery_candidate(
+                    &observation.tag_key,
+                    config.discovery_evidence_retention,
+                    1,
+                    1,
+                    100,
+                    2,
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        let lpr_timestamp =
+            DateTime::<Utc>::from_timestamp_millis(observation.observed_at_ms + 1_000).unwrap();
+        *counts.lpr_hits.lock().unwrap() = vec![lpr_hit_for_actor(
+            lpr_timestamp,
+            "LATE123",
+            "ACCESS",
+            "visitor",
+            visitor_id,
+        )];
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let mut restarted_gate = GateRuntime {
+            unifi: Some(UnifiClient::new(&config).unwrap()),
+            last_attempts: HashMap::new(),
+            lpr_last_attempts: HashMap::new(),
+            discovery_last_attempts: HashMap::new(),
+            discovery_retry_attempts: HashMap::new(),
+            discovery_lpr_cache: None,
+        };
+        retry_pending_discovery_matches(&config, &mut restarted_gate, &mut store)
+            .await
+            .unwrap();
+
+        let candidate = store
+            .discovery_candidate(
+                &observation.tag_key,
+                config.discovery_evidence_retention,
+                1,
+                1,
+                100,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(candidate.ready);
+        assert_eq!(candidate.plate, "LATE123");
+        assert_eq!(candidate.lpr_actor_type, "visitor");
+        assert_eq!(candidate.lpr_actor_id, visitor_id);
+        assert_eq!(counts.lpr_reads.load(Ordering::SeqCst), 2);
+
+        retry_pending_discovery_matches(&config, &mut restarted_gate, &mut store)
+            .await
+            .unwrap();
+        assert_eq!(counts.lpr_reads.load(Ordering::SeqCst), 2);
         server.abort();
     }
 
@@ -1895,6 +2116,7 @@ mod tests {
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
+            discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
         };
 
@@ -1943,6 +2165,7 @@ mod tests {
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
+            discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
         };
 
@@ -1989,6 +2212,7 @@ mod tests {
             last_attempts: HashMap::new(),
             lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
+            discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
         };
 

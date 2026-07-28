@@ -59,9 +59,23 @@ pub struct GateEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoverySeen {
     pub passage_id: i64,
+    pub started_at_ms: i64,
+    pub last_seen_ms: i64,
     pub correlation_status: String,
     pub long_dwell: bool,
     pub became_long_dwell: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingDiscoveryPassage {
+    pub passage_id: i64,
+    pub tag_key: String,
+    pub identity_kind: String,
+    pub tid: Option<String>,
+    pub epc: String,
+    pub peak_rssi_cdbm: i32,
+    pub started_at_ms: i64,
+    pub last_seen_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,6 +232,8 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS discovery_passages_tag_time
                  ON discovery_passages(tag_key, started_at_ms DESC);
+             CREATE INDEX IF NOT EXISTS discovery_passages_pending_retry
+                 ON discovery_passages(correlation_status, stationary, last_seen_ms);
              CREATE TABLE IF NOT EXISTS learned_tag_ownership (
                  tag_key TEXT PRIMARY KEY REFERENCES discovery_tags(tag_key) ON DELETE CASCADE,
                  unifi_user_id TEXT NOT NULL,
@@ -569,6 +585,8 @@ impl Store {
         transaction.commit()?;
         Ok(DiscoverySeen {
             passage_id,
+            started_at_ms: session_started_ms,
+            last_seen_ms: observed_at_ms,
             correlation_status,
             long_dwell,
             became_long_dwell: long_dwell && !was_stationary,
@@ -584,6 +602,47 @@ impl Store {
             [passage_id],
         )?;
         Ok(changed > 0)
+    }
+
+    pub fn pending_discovery_passages(
+        &self,
+        retry_before_ms: i64,
+        cutoff_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<PendingDiscoveryPassage>> {
+        let mut statement = self.connection.prepare(
+            "SELECT p.id, p.tag_key, t.identity_kind, t.tid, p.epc,
+                    p.peak_rssi_cdbm, p.started_at_ms, p.last_seen_ms
+             FROM discovery_passages p
+             JOIN discovery_tags t ON t.tag_key = p.tag_key
+             WHERE p.correlation_status = 'pending'
+               AND p.stationary = 0
+               AND p.last_seen_ms <= ?1
+               AND p.last_seen_ms >= ?2
+             ORDER BY p.last_seen_ms, p.id
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                retry_before_ms,
+                cutoff_ms,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                Ok(PendingDiscoveryPassage {
+                    passage_id: row.get(0)?,
+                    tag_key: row.get(1)?,
+                    identity_kind: row.get(2)?,
+                    tid: row.get(3)?,
+                    epc: row.get(4)?,
+                    peak_rssi_cdbm: row.get(5)?,
+                    started_at_ms: row.get(6)?,
+                    last_seen_ms: row.get(7)?,
+                })
+            },
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn record_discovery_match(
