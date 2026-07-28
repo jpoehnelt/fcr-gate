@@ -144,14 +144,18 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub async fn start(
+pub async fn bind(config: &Config) -> Result<TcpListener> {
+    TcpListener::bind(config.web_bind)
+        .await
+        .with_context(|| format!("failed to bind operator UI to {}", config.web_bind))
+}
+
+pub fn start(
     config: &Config,
     unifi: Option<UnifiClient>,
     reader_health: ReaderHealth,
-) -> Result<WebHandle> {
-    let listener = TcpListener::bind(config.web_bind)
-        .await
-        .with_context(|| format!("failed to bind operator UI to {}", config.web_bind))?;
+    listener: TcpListener,
+) -> WebHandle {
     let state = AppState {
         db_path: Arc::new(config.state_db.clone()),
         unifi,
@@ -187,10 +191,10 @@ pub async fn start(
         }
     });
     info!(%address, "gateway HTTP service listening on loopback");
-    Ok(WebHandle {
+    WebHandle {
         shutdown: Some(shutdown_sender),
         task,
-    })
+    }
 }
 
 async fn health(State(state): State<AppState>) -> Response {
@@ -513,6 +517,8 @@ mod tests {
             health_enabled: true,
             health_stale_after: Duration::from_secs(120),
             web_bind: "127.0.0.1:8080".parse().unwrap(),
+            metrics_enabled: false,
+            metrics_bind: "127.0.0.1:9101".parse().unwrap(),
             claim_window: Duration::from_secs(60),
             lpr_correlation_mode: LprCorrelationMode::Disabled,
             lpr_correlation_window: Duration::from_secs(10),

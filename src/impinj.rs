@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::{config::Config, model::ReaderEvent};
+use crate::{config::Config, metrics::AppMetrics, model::ReaderEvent};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(90);
@@ -234,7 +234,7 @@ impl ImpinjClient {
         Ok(())
     }
 
-    pub async fn stream_events(self, sender: mpsc::Sender<ReaderEvent>) {
+    pub async fn stream_events(self, sender: mpsc::Sender<ReaderEvent>, metrics: AppMetrics) {
         let mut backoff = Duration::from_secs(1);
         loop {
             match self.stream_once(&sender).await {
@@ -244,6 +244,7 @@ impl ImpinjClient {
                 }
                 Err(error) => {
                     self.health.mark_disconnected();
+                    metrics.reader_reconnect();
                     warn!(%error, retry_seconds = backoff.as_secs(), "reader event stream disconnected");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
