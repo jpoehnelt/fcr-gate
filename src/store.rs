@@ -339,17 +339,85 @@ impl Store {
         self.connection.execute(
             "INSERT INTO tag_observations
                  (tid, epc, last_seen_at, last_seen_ms, last_rssi_cdbm)
-             SELECT tid, assigned_epc, ?1, ?2, ?3
+             SELECT tid, ?1, ?2, ?3, ?4
              FROM encodings
-             WHERE tid = ?4 AND assigned_epc = ?5 AND status = 'completed'
+             WHERE tid = ?5 AND status = 'completed'
              ON CONFLICT(tid) DO UPDATE SET
                  epc = excluded.epc,
                  last_seen_at = excluded.last_seen_at,
                  last_seen_ms = excluded.last_seen_ms,
                  last_rssi_cdbm = excluded.last_rssi_cdbm
              WHERE excluded.last_seen_ms - tag_observations.last_seen_ms >= 1000",
-            params![timestamp(), now_ms, rssi_cdbm, tid, epc],
+            params![epc, timestamp(), now_ms, rssi_cdbm, tid],
         )?;
+        Ok(())
+    }
+
+    pub fn register_observed_tid(&mut self, tid: &str, epc: &str, rssi_cdbm: i32) -> Result<()> {
+        validate_hex(tid, "TID")?;
+        validate_hex(epc, "observed EPC")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM encodings WHERE tid = ?1",
+                [tid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let now = timestamp();
+        if existing.is_none() {
+            let sequence: i64 = transaction.query_row(
+                "SELECT next_sequence FROM allocator WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            if sequence > i64::from(u32::MAX) {
+                bail!("TID sequence space exhausted");
+            }
+            transaction.execute(
+                "UPDATE allocator SET next_sequence = next_sequence + 1 WHERE id = 1",
+                [],
+            )?;
+            transaction.execute(
+                "INSERT INTO encodings
+                 (sequence, tid, assigned_epc, status, attempts, retry_after_ms,
+                  created_at, updated_at, completed_at)
+                 VALUES (?1, ?2, ?3, 'completed', 0, 0, ?4, ?4, ?4)",
+                params![sequence, tid, format!("TID:{tid}"), now],
+            )?;
+            audit_tx(
+                &transaction,
+                &self.actor,
+                "tid-registered",
+                Some(tid),
+                Some(epc),
+                Some("registered from inventory without modifying tag memory"),
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE encodings
+                 SET status = 'completed', retry_after_ms = 0, last_error = NULL,
+                     updated_at = ?1, completed_at = COALESCE(completed_at, ?1)
+                 WHERE tid = ?2",
+                params![now, tid],
+            )?;
+        }
+        let observed_at_ms = now_ms();
+        transaction.execute(
+            "INSERT INTO tag_observations
+                 (tid, epc, last_seen_at, last_seen_ms, last_rssi_cdbm)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(tid) DO UPDATE SET
+                 epc = excluded.epc,
+                 last_seen_at = excluded.last_seen_at,
+                 last_seen_ms = excluded.last_seen_ms,
+                 last_rssi_cdbm = excluded.last_rssi_cdbm
+             WHERE excluded.last_seen_ms - tag_observations.last_seen_ms >= 1000",
+            params![tid, epc, now, observed_at_ms, rssi_cdbm],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1226,7 +1294,7 @@ impl Store {
 
     pub fn list_tags(&self, limit: usize) -> Result<Vec<TagRecord>> {
         let mut statement = self.connection.prepare(
-            "SELECT e.sequence, e.tid, e.assigned_epc, e.status,
+            "SELECT e.sequence, e.tid, COALESCE(obs.epc, e.assigned_epc), e.status,
                     COALESCE(own.status, 'unassigned'),
                     own.unifi_user_id, own.unifi_user_name, own.vehicle_description,
                     own.assigned_at, own.assigned_by,
@@ -1271,9 +1339,9 @@ impl Store {
             )
             .with_context(|| format!("unknown TID {tid}"))?;
         if encoding_status != "completed" {
-            bail!("TID {tid} has not completed encoding");
+            bail!("TID {tid} has not been registered from reader inventory");
         }
-        let last_seen_ms = last_seen_ms.context("tag has not been observed since encoding")?;
+        let last_seen_ms = last_seen_ms.context("tag has not been observed by the reader")?;
         let age_ms = now_ms().saturating_sub(last_seen_ms);
         if age_ms < 0 || age_ms > duration_ms(claim_window) {
             bail!("tag is no longer inside the claim window; present it to the reader again");
@@ -1962,7 +2030,31 @@ mod tests {
     }
 
     #[test]
-    fn stale_observation_and_wrong_epc_cannot_be_claimed() {
+    fn shared_epc_tags_register_as_distinct_tids_without_writes() {
+        let directory = tempdir().unwrap();
+        let mut store = Store::open(&directory.path().join("state.sqlite3"), "gate-auto").unwrap();
+        let epc = "300833B2DDD9014000000000";
+
+        store.register_observed_tid("E2801111", epc, -4200).unwrap();
+        store.register_observed_tid("E2802222", epc, -4300).unwrap();
+
+        let tags = store.list_tags(10).unwrap();
+        assert_eq!(tags.len(), 2);
+        assert!(tags.iter().all(|tag| tag.epc == epc));
+        assert_ne!(tags[0].tid, tags[1].tid);
+        let write_audits: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE kind LIKE 'write%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(write_audits, 0);
+    }
+
+    #[test]
+    fn epc_changes_are_metadata_and_stale_tags_cannot_be_claimed() {
         let directory = tempdir().unwrap();
         let mut store =
             Store::open(&directory.path().join("state.sqlite3"), "operator@test").unwrap();
@@ -1974,11 +2066,9 @@ mod tests {
         store
             .record_seen(&encoding.tid, "DEADBEEF0000000000000001", -4200)
             .unwrap();
-        assert!(store.list_tags(10).unwrap()[0].last_seen_ms.is_none());
-
-        store
-            .record_seen(&encoding.tid, &encoding.assigned_epc, -4200)
-            .unwrap();
+        let tag = &store.list_tags(10).unwrap()[0];
+        assert_eq!(tag.epc, "DEADBEEF0000000000000001");
+        assert!(tag.last_seen_ms.is_some());
         store
             .connection
             .execute(

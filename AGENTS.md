@@ -62,9 +62,9 @@ recurring Visitors so they can pass the Entry Gate.
   visitor and unassigns all their plates. `--dry-run` / `--apply`. Cannot remove
   the cancelled shells (no API hard-delete) — those need the Access UI.
 - `fcr-gate-admin epc-report` — inspect an Impinj reported-EPC CSV offline.
-- `fcr-rfid-encoder` — long-running R700 encoder, assignment UI, health endpoint,
-  optional UniFi-authorized Entry Gate trigger, and multi-visit discovery of
-  existing non-default vehicle tags.
+- `fcr-rfid-encoder` — long-running R700 TID inventory, assignment UI, health
+  endpoint, optional UniFi-authorized Entry Gate trigger, and multi-visit vehicle
+  correlation. It never writes tag memory; EPC is observation metadata only.
   - `discovery-status` reports retained tag-to-plate evidence. Visitor-backed
     candidates remain `needs-resident`.
   - `associate-discovered TAG_KEY UNIFI_USER_ID --dry-run` validates a proposed

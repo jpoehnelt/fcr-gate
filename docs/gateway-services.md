@@ -3,7 +3,7 @@
 This repository owns two gateway services:
 
 1. `cloudflared`, exposing only the loopback web service through Cloudflare Tunnel.
-2. `fcr-rfid-encoder`, an Impinj R700 inventory/exact-TID EPC writer, authenticated
+2. `fcr-rfid-encoder`, an Impinj R700 TID inventory service, authenticated
    tag-assignment UI, and optional UniFi-authorized gate trigger.
 
 For the release installer and basic commands, start with the
@@ -27,12 +27,11 @@ flowchart LR
 - Cloudflare Access must protect the hostname before the operator UI is enabled.
 - Every operator route requires Cloudflare's authenticated-user email header;
   Cloudflare Access policy determines which identities are allowed.
-- RFID writes default to disabled and require an explicit server-side setting.
+- The RFID service has no tag-memory write path. `RFID_WRITES_ENABLED=true` is
+  rejected at startup.
 - UniFi gate unlocks use a separate setting and also default to disabled.
 - `/healthz` contains no tag or user data, binds to loopback with the UI, and should
   use a Cloudflare Access service token for external monitoring.
-- Every write must record the operator, requested EPC, result, and timestamp without
-  logging reader passwords, tunnel tokens, or other credentials.
 - Reader and Cloudflare credentials live below `/data/fcr-gate/secrets/` with mode
   `0600`; they are never command-line arguments or repository content.
 - Reported EPC exports are operational data and remain ignored by Git.
@@ -49,70 +48,44 @@ service. Do not put either the old or new password in this repository.
 - R700 firmware 9.x first-login behavior:
   <https://support.impinj.com/hc/article_attachments/22893542233107>
 
-## R700 encoder
+## R700 TID inventory
 
 The Rust service uses the R700 IoT Device Interface rather than LLRP. At startup it
-checks `/api/v1/status`, verifies tag-access support from `/api/v1/openapi.json`,
-and installs a persistent inventory preset. It streams newline-delimited events
-from `/api/v1/data/stream` and submits one transient access operation at
-`/api/v1/profiles/inventory/tag-access`.
+checks `/api/v1/status` and installs a persistent inventory preset with FastID
+enabled. It streams newline-delimited events from `/api/v1/data/stream`. There is
+no request to `/api/v1/profiles/inventory/tag-access` and no EPC allocation,
+write, read-back, repair, or retry state machine.
 
-An encode transaction has all of these gates:
+A usable observation must report a valid hexadecimal TID, come from the configured
+antenna, and meet `RFID_DISCOVERY_MIN_RSSI_CDBM`. The service immediately registers
+that TID in SQLite so it can appear in the assignment UI and participate in LPR
+correlation. The currently observed EPC is retained as metadata and may change
+without changing identity or creating a conflict. Multiple TIDs may report the
+same EPC.
 
-1. The tag is on the configured antenna, has the known default EPC, reports a TID
-   through FastID, and exceeds the RSSI threshold.
-2. The same TID is read repeatedly during a short window, with no second default-EPC
-   TID present. Only one transaction may be in flight.
-3. A SQLite transaction durably assigns the TID a site prefix plus 32-bit sequence.
-4. The R700 selector matches the complete TID. Six one-word commands write EPC bank
-   words 2 through 7, followed by a six-word read-back command.
-5. Every command must report success and the read-back must equal the assigned EPC.
-6. A subsequent normal inventory event must pair the same TID with the new EPC.
-
-The database uses WAL mode and `synchronous=FULL`. Interrupted queued operations
-return to `pending` on restart and reuse their existing EPC; they never allocate a
-replacement. Failed writes use a cooldown and maximum-attempt limit. An unexpected
-non-default EPC for an assigned TID becomes a conflict requiring an explicit retry.
-The audit table records allocations, attempts, verification, completion, failures,
-and the configured actor without storing reader credentials.
-
-Retrying a conflict explicitly authorizes repair of that exact TID back to its
-existing durable assignment. The normal default-EPC and ambiguity gates still
-apply to ordinary first-time encodes.
+Existing databases upgrade in place. Historical encoding rows remain for schema
+compatibility, but a later TID observation marks the tag usable without modifying
+the physical tag. New registrations use the TID for their internal unique key.
+The database continues to use WAL mode and `synchronous=FULL`.
 
 The event connection is recycled after 90 seconds without reader data, and an
-in-flight transaction is released after its configured timeout. SIGINT/SIGTERM
-shutdown stops the service-owned preset, which also makes the R700 discard any
-still-pending transient access request.
+SIGINT/SIGTERM shutdown stops the service-owned preset.
 
-Writes are disabled by default. Commission them in this order:
+Commission TID inventory in this order:
 
 1. Set the R700 to the IoT Device Interface and configure its regulatory region.
-2. Isolate one loose tag in the antenna field. A far-field gate antenna can see a
-   nearby spool or vehicle tag, so physical separation and reduced transmit power
-   are part of the safety system.
-3. Configure the reader password file, antenna port, conservative power/RSSI values,
-   and leave `RFID_WRITES_ENABLED=false`. Run until logs consistently report one
-   dry-run candidate.
-4. Choose and record a site-unique 64-bit `RFID_EPC_PREFIX`. This implementation
-   writes only the 96-bit EPC; it does not change access, kill, or lock state.
-5. Enable writes for a single test tag. Verify the service reports both read-back
-   and ordinary-inventory confirmation before using it at the gate.
+2. Enable FastID and verify inventory events contain `tidHex`.
+3. Configure the reader password file, antenna port, and conservative power/RSSI
+   values. Leave the deprecated `RFID_WRITES_ENABLED=false`.
+4. Start with discovery and gate modes disabled, then enable their dry-run modes
+   separately and inspect the resulting candidates and decisions.
 
-Tags that do not provide a usable FastID TID are ignored intentionally; the service
-will not fall back to selecting the shared default EPC. Inspect state or authorize a
-controlled retry with:
-
-```bash
-RFID_STATE_DB=/data/fcr-gate/rfid-encoder.sqlite3 \
-  /data/fcr-gate/bin/fcr-rfid-encoder status
-RFID_STATE_DB=/data/fcr-gate/rfid-encoder.sqlite3 \
-  /data/fcr-gate/bin/fcr-rfid-encoder retry <TID>
-```
+Tags without a usable FastID TID are ignored intentionally. The service never
+falls back to EPC identity.
 
 ## Ownership and gate authorization
 
-Encoding and ownership are deliberately separate. A newly encoded tag is
+Observation and ownership are deliberately separate. A newly observed TID is
 `unassigned`, even if it is immediately readable at the gate. The operator UI
 allows a claim only while that exact TID has been seen recently. It searches active
 UniFi users, verifies that the selected user has an Entry Gate policy, and stores
@@ -124,13 +97,13 @@ reserved in the database for operational loss handling). Transfers require an
 explicit revoke followed by a new claim. Claims and revocations record the
 Cloudflare-authenticated operator email in `audit_log`.
 
-`RFID_LPR_CORRELATION_MODE=dry-run` or `live` can correlate a newly encoded tag
+`RFID_LPR_CORRELATION_MODE=dry-run` or `live` can correlate a newly observed TID
 with an existing permanent UniFi user automatically. The service considers only
 one completed tag that has never been assigned, then reads a short window of
 Entry Gate `LICENSEPLATE` logs. A match requires exactly one plate and one distinct
 successful `ACCESS` user/plate pair whose actor type is `user`, plus an active user
 and an Entry Gate access policy. Repeated reads of that same pair are harmless.
-Visitor events do not directly assign a newly encoded tag to a permanent user.
+Visitor events do not directly assign a newly observed tag to a permanent user.
 They remain available to multi-visit discovery instead. Blocked-only reads,
 another plate, another unassigned tag, truncated logs, or malformed data do not
 create an assignment.
@@ -147,12 +120,10 @@ correlation suppresses a redundant RFID unlock on that pass.
 
 ### Multi-visit discovery for existing vehicle tags
 
-`RFID_DISCOVERY_MODE=dry-run` or `live` learns existing non-default tags such as a
-readable toll pass without rewriting them. TID is the durable identity when the
-tag reports it; otherwise the service uses `EPC:<hex>` as a lower-confidence
-fallback. The configured factory-default EPC is always excluded. EPC-only
-candidates require at least five matches even when
-`RFID_DISCOVERY_MIN_OCCURRENCES` is lower.
+`RFID_DISCOVERY_MODE=dry-run` or `live` learns any readable TID, including
+headlight tags that all retain the same factory EPC and existing toll tags. TID is
+the only durable identity. Tags without TID are ignored, and EPC-only discovery
+keys are rejected.
 
 Each period of continuous RFID visibility is one passage. Repeated inventory reads
 and repeated queries of the same UniFi LPR event cannot add votes. A passage is
@@ -204,12 +175,12 @@ set -a
 set +a
 /data/fcr-gate/bin/fcr-rfid-encoder discovery-status --limit 100
 /data/fcr-gate/bin/fcr-rfid-encoder associate-discovered \
-  TID_OR_EPC_KEY UNIFI_USER_ID --dry-run
+  TID UNIFI_USER_ID --dry-run
 # After reviewing the validated plan:
 /data/fcr-gate/bin/fcr-rfid-encoder associate-discovered \
-  TID_OR_EPC_KEY UNIFI_USER_ID --apply
-/data/fcr-gate/bin/fcr-rfid-encoder revoke-learned TID_OR_EPC_KEY
-/data/fcr-gate/bin/fcr-rfid-encoder reset-learned SUSPENDED_TID_OR_EPC_KEY
+  TID UNIFI_USER_ID --apply
+/data/fcr-gate/bin/fcr-rfid-encoder revoke-learned TID
+/data/fcr-gate/bin/fcr-rfid-encoder reset-learned SUSPENDED_TID
 ```
 
 Some toll systems use protocols the R700 cannot inventory; those passes will not
@@ -306,13 +277,12 @@ once to install and start the unit. This is a community-supported appliance
 customization, so verify it after every UniFi OS upgrade.
 
 Install `deploy/30-fcr-rfid-encoder.sh` through the same boot-hook mechanism after
-cross-compiling/copying the encoder binary for the gateway architecture. Start
+cross-compiling/copying the RFID binary for the gateway architecture. Start
 with the example environment and keep the password and environment files mode
-`0600`. The script enables the unit; it does not alter the checked-in safety
-default that keeps writes off.
+`0600`. The script enables the unit; tag-memory writes are absent from the binary.
 
 Tagged GitHub releases automate installation and updates for the FCR Gate binaries
-and encoder service. They do not install or update `cloudflared`. See
+and RFID service. They do not install or update `cloudflared`. See
 [Install on the UniFi gateway](../README.md#install-on-the-unifi-gateway) for the
 verified release workflow.
 

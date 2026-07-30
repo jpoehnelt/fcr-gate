@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     time::{Duration, Instant},
 };
 
@@ -8,13 +8,11 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use fcr_rfid_encoder::{
     config::{Config, GateMode, LprCorrelationMode, normalize_hex, state_db_path},
-    engine::{Action, Engine},
     impinj::ImpinjClient,
-    model::{DiscoveryObservation, ReaderEvent, TagObservation},
+    model::{DiscoveryObservation, ReaderEvent},
     plate::same_plate_family,
     store::{
         DiscoveryCandidate, DiscoverySeen, PassageMatchOutcome, PendingDiscoveryPassage, Store,
-        now_ms,
     },
     unifi::{AuthorizationDecision, LprCorrelation, UnifiClient},
     web,
@@ -32,21 +30,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the R700 inventory and encode-on-first-arrival loop.
+    /// Run the R700 TID inventory and gate-correlation loop.
     Run,
-    /// Show durable EPC assignments and their current state.
-    Status {
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-    },
     /// Show recent live and dry-run gate authorization decisions.
     GateEvents {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Reset a failed or conflicted TID for another controlled attempt.
-    Retry { tid: String },
-    /// Show multi-visit EPC/TID-to-vehicle discovery candidates.
+    /// Show multi-visit TID-to-vehicle discovery candidates.
     DiscoveryStatus {
         #[arg(long, default_value_t = 100)]
         limit: usize,
@@ -106,9 +97,7 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command.unwrap_or(Command::Run) {
         Command::Run => run().await,
-        Command::Status { limit } => status(limit),
         Command::GateEvents { limit } => gate_events(limit),
-        Command::Retry { tid } => retry(&tid),
         Command::DiscoveryStatus { limit } => discovery_status(limit),
         Command::AssociateDiscovered {
             tag_key,
@@ -124,10 +113,6 @@ async fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let config = Config::from_env()?;
     let mut store = Store::open(&config.state_db, config.actor.clone())?;
-    let recovered = store.recover_interrupted()?;
-    if recovered > 0 {
-        warn!(recovered, "recovered interrupted encoding assignments");
-    }
 
     let reader = ImpinjClient::new(&config)?;
     reader.ensure_profile(&config).await?;
@@ -146,14 +131,6 @@ async fn run() -> Result<()> {
     } else {
         None
     };
-    let mut engine = Engine::new(
-        config.antenna_port,
-        config.default_epc.clone(),
-        config.min_rssi_cdbm,
-        config.confirm_reads,
-        config.confirm_window,
-    );
-    let mut dry_run_reported = HashSet::new();
     let mut gate = GateRuntime {
         unifi,
         last_attempts: HashMap::new(),
@@ -168,22 +145,15 @@ async fn run() -> Result<()> {
     tokio::pin!(shutdown);
 
     info!(
-        writes_enabled = config.writes_enabled,
         antenna = config.antenna_port,
-        min_rssi_dbm = config.min_rssi_cdbm as f64 / 100.0,
-        confirm_reads = config.confirm_reads,
+        min_rssi_dbm = config.discovery_min_rssi_cdbm as f64 / 100.0,
         operator_ui = config.web_enabled,
         health_endpoint = config.health_enabled,
         lpr_correlation_mode = config.lpr_correlation_mode.as_str(),
         discovery_mode = config.discovery_mode.as_str(),
         gate_mode = config.gate_mode.as_str(),
-        "RFID encoder service ready"
+        "RFID TID service ready"
     );
-    if !config.writes_enabled {
-        warn!(
-            "RFID writes are disabled; candidates will be observed but never allocated or modified"
-        );
-    }
 
     loop {
         tokio::select! {
@@ -200,16 +170,6 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
             _ = timeout_check.tick() => {
-                if let Some(tid) = engine.expire_in_flight(Instant::now(), config.access_timeout) {
-                    let reason = "tag access/read-back inventory confirmation timed out";
-                    store.mark_access_failed(
-                        &tid,
-                        reason,
-                        config.retry_cooldown,
-                        config.max_attempts,
-                    )?;
-                    warn!(%tid, "encoding transaction timed out and was released for retry");
-                }
                 if config.discovery_mode.enabled() {
                     match tokio::time::timeout(
                         DISCOVERY_LPR_RETRY_PASS_TIMEOUT,
@@ -234,10 +194,7 @@ async fn run() -> Result<()> {
                 };
                 if let Err(error) = handle_event(
                     &config,
-                    &reader,
                     &mut store,
-                    &mut engine,
-                    &mut dry_run_reported,
                     &mut gate,
                     event,
                 ).await {
@@ -268,127 +225,28 @@ async fn shutdown_signal() -> Result<()> {
 
 async fn handle_event(
     config: &Config,
-    reader: &ImpinjClient,
     store: &mut Store,
-    engine: &mut Engine,
-    dry_run_reported: &mut HashSet<String>,
     gate: &mut GateRuntime,
     event: ReaderEvent,
 ) -> Result<()> {
-    if let Some(discovery) = DiscoveryObservation::from_reader_event(&event) {
-        if discovery.antenna_port == config.antenna_port
-            && discovery.peak_rssi_cdbm >= config.discovery_min_rssi_cdbm
-            && discovery.epc != config.default_epc
-        {
-            let already_encoded = if let Some(tid) = &discovery.tid {
-                store.get_by_tid(tid)?.is_some()
-            } else {
-                store.has_encoding_epc(&discovery.epc)?
-            };
-            if !already_encoded {
-                if config.discovery_mode.enabled() {
-                    maybe_learn_discovered_tag(config, gate, store, &discovery).await?;
-                }
-                maybe_unlock_gate_identity(config, gate, store, &discovery.tag_key, &discovery.epc)
-                    .await?;
-            }
-        }
-    }
-
-    let Some(observation) = TagObservation::from_reader_event(&event) else {
+    let Some(observation) = DiscoveryObservation::from_reader_event(&event) else {
         return Ok(());
     };
-    let assignment = store.get_by_tid(&observation.tid)?;
-    if assignment.as_ref().is_some_and(|encoding| {
-        encoding.status == "completed" && encoding.assigned_epc == observation.epc
-    }) {
-        store.record_seen(
-            &observation.tid,
-            &observation.epc,
-            observation.peak_rssi_cdbm,
-        )?;
-        maybe_correlate_lpr(config, gate, store, &observation).await?;
-        maybe_unlock_gate_identity(config, gate, store, &observation.tid, &observation.epc).await?;
+    if observation.antenna_port != config.antenna_port
+        || observation.peak_rssi_cdbm < config.discovery_min_rssi_cdbm
+    {
+        return Ok(());
     }
-    let action = engine.observe(&observation, assignment.as_ref(), Instant::now());
-
-    match action {
-        Action::None => {}
-        Action::CandidateReady { tid } => {
-            if !config.writes_enabled {
-                if dry_run_reported.insert(tid.clone()) {
-                    info!(
-                        %tid,
-                        rssi_dbm = observation.peak_rssi_cdbm as f64 / 100.0,
-                        "dry-run candidate satisfied all encoding gates"
-                    );
-                }
-                return Ok(());
-            }
-
-            let prefix = config
-                .epc_prefix
-                .as_deref()
-                .context("missing EPC prefix while writes are enabled")?;
-            let encoding = match assignment {
-                Some(encoding) => encoding,
-                None => store.allocate(&tid, prefix)?,
-            };
-            if !encoding.may_attempt(now_ms(), config.max_attempts) {
-                return Ok(());
-            }
-
-            match reader
-                .queue_epc_write(
-                    &encoding.tid,
-                    &encoding.assigned_epc,
-                    config.tag_access_password.as_deref(),
-                )
-                .await
-            {
-                Ok(()) => {
-                    store.mark_queued(&encoding.tid)?;
-                    engine.set_in_flight(encoding.tid.clone(), Instant::now());
-                    info!(
-                        tid = %encoding.tid,
-                        epc = %encoding.assigned_epc,
-                        attempt = encoding.attempts + 1,
-                        "queued exact-TID EPC write"
-                    );
-                }
-                Err(error) => {
-                    store.mark_post_failed(
-                        &encoding.tid,
-                        &error.to_string(),
-                        config.retry_cooldown,
-                    )?;
-                    engine.clear_in_flight(&encoding.tid);
-                    return Err(error);
-                }
-            }
-        }
-        Action::AccessVerified { tid, epc } => {
-            store.mark_verified(&tid, &epc)?;
-            info!(%tid, %epc, "all EPC words and read-back verified; awaiting inventory confirmation");
-        }
-        Action::AccessFailed { tid, reason } => {
-            store.mark_access_failed(&tid, &reason, config.retry_cooldown, config.max_attempts)?;
-            engine.clear_in_flight(&tid);
-            warn!(%tid, %reason, "EPC write transaction failed");
-        }
-        Action::Completed { tid, epc } => {
-            store.mark_completed(&tid, &epc)?;
-            store.record_seen(&tid, &epc, observation.peak_rssi_cdbm)?;
-            engine.clear_in_flight(&tid);
-            info!(%tid, %epc, "encoding completed and confirmed by normal inventory");
-            maybe_correlate_lpr(config, gate, store, &observation).await?;
-        }
-        Action::Conflict { tid, observed_epc } => {
-            store.mark_conflict(&tid, &observed_epc)?;
-            engine.clear_in_flight(&tid);
-            error!(%tid, %observed_epc, "TID reported an EPC different from its durable assignment");
-        }
+    let tid = observation
+        .tid
+        .as_deref()
+        .context("validated TID observation omitted its TID")?;
+    store.register_observed_tid(tid, &observation.epc, observation.peak_rssi_cdbm)?;
+    if config.discovery_mode.enabled() {
+        maybe_learn_discovered_tag(config, gate, store, &observation).await?;
     }
+    maybe_correlate_lpr(config, gate, store, &observation).await?;
+    maybe_unlock_gate_identity(config, gate, store, &observation.tag_key, &observation.epc).await?;
     Ok(())
 }
 
@@ -609,15 +467,10 @@ async fn match_discovery_passage(
         return Ok(());
     }
 
-    let min_occurrences = if observation.identity_kind == "epc" {
-        config.discovery_min_occurrences.max(5)
-    } else {
-        config.discovery_min_occurrences
-    };
     let Some(candidate) = store.discovery_candidate(
         &observation.tag_key,
         config.discovery_evidence_retention,
-        min_occurrences,
+        config.discovery_min_occurrences,
         config.discovery_min_days,
         config.discovery_min_confidence_percent,
         config.discovery_conflict_occurrences,
@@ -738,7 +591,9 @@ async fn retry_pending_discovery_matches(
             },
         );
 
-        let observation = pending_discovery_observation(config, &passage);
+        let Some(observation) = pending_discovery_observation(config, &passage) else {
+            continue;
+        };
         let seen = DiscoverySeen {
             passage_id: passage.passage_id,
             started_at_ms: passage.started_at_ms,
@@ -764,31 +619,33 @@ async fn retry_pending_discovery_matches(
 fn pending_discovery_observation(
     config: &Config,
     passage: &PendingDiscoveryPassage,
-) -> DiscoveryObservation {
-    let identity_kind = match passage.identity_kind.as_str() {
-        "tid" => "tid",
-        "epc" => "epc",
-        _ => unreachable!("discovery identity kind is constrained by SQLite"),
-    };
-    DiscoveryObservation {
+) -> Option<DiscoveryObservation> {
+    if passage.identity_kind != "tid" || passage.tid.is_none() {
+        return None;
+    }
+    Some(DiscoveryObservation {
         tag_key: passage.tag_key.clone(),
-        identity_kind,
+        identity_kind: "tid",
         tid: passage.tid.clone(),
         epc: passage.epc.clone(),
         antenna_port: config.antenna_port,
         peak_rssi_cdbm: passage.peak_rssi_cdbm,
         observed_at_ms: passage.last_seen_ms,
-    }
+    })
 }
 
 async fn maybe_correlate_lpr(
     config: &Config,
     gate: &mut GateRuntime,
     store: &mut Store,
-    observation: &TagObservation,
+    observation: &DiscoveryObservation,
 ) -> Result<()> {
+    let tid = observation
+        .tid
+        .as_deref()
+        .context("TID-only LPR correlation received an EPC-only observation")?;
     if config.lpr_correlation_mode == LprCorrelationMode::Disabled
-        || store.get_active_owner(&observation.tid)?.is_some()
+        || store.get_active_owner(tid)?.is_some()
     {
         return Ok(());
     }
@@ -796,24 +653,23 @@ async fn maybe_correlate_lpr(
     let attempt_time = Instant::now();
     if gate
         .lpr_last_attempts
-        .get(&observation.tid)
+        .get(tid)
         .is_some_and(|last| attempt_time.duration_since(*last) < config.lpr_correlation_poll)
     {
         return Ok(());
     }
-    gate.lpr_last_attempts
-        .insert(observation.tid.clone(), attempt_time);
+    gate.lpr_last_attempts.insert(tid.to_owned(), attempt_time);
 
     let now = Utc::now();
     let now_ms = now.timestamp_millis();
     let recent_tids = store.recent_never_assigned_tids(config.lpr_correlation_window)?;
-    if recent_tids.len() != 1 || recent_tids[0] != observation.tid {
-        if recent_tids.iter().any(|tid| tid == &observation.tid) && recent_tids.len() > 1 {
+    if recent_tids.len() != 1 || recent_tids[0] != tid {
+        if recent_tids.iter().any(|recent| recent == tid) && recent_tids.len() > 1 {
             for tid in &recent_tids {
                 store.advance_lpr_correlation_not_before(tid, now_ms)?;
             }
             warn!(
-                tid = %observation.tid,
+                %tid,
                 tag_count = recent_tids.len(),
                 "LPR correlation deferred because multiple unassigned RFID tags are present; a new plate event will be required"
             );
@@ -824,7 +680,7 @@ async fn maybe_correlate_lpr(
     let window_ms = i64::try_from(config.lpr_correlation_window.as_millis()).unwrap_or(i64::MAX);
     let window_start_ms = now_ms.saturating_sub(window_ms);
     let since_ms = store
-        .lpr_correlation_not_before_ms(&observation.tid)?
+        .lpr_correlation_not_before_ms(tid)?
         .map_or(window_start_ms, |cutoff| cutoff.max(window_start_ms));
     let since = DateTime::<Utc>::from_timestamp_millis(since_ms)
         .context("LPR correlation cutoff is outside the supported date range")?;
@@ -839,23 +695,23 @@ async fn maybe_correlate_lpr(
     match unifi.find_lpr_user_match(since, now).await? {
         LprCorrelation::NoMatch => {}
         LprCorrelation::Ambiguous { reason } => {
-            store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
+            store.advance_lpr_correlation_not_before(tid, now_ms)?;
             let detail = serde_json::json!({"reason": reason}).to_string();
             store.record_lpr_correlation_audit(
-                &observation.tid,
+                tid,
                 &observation.epc,
                 "lpr-correlation-ambiguous",
                 &detail,
             )?;
             warn!(
-                tid = %observation.tid,
+                %tid,
                 %reason,
                 "LPR correlation was ambiguous; a new plate event will be required"
             );
         }
         LprCorrelation::Match(candidate) => {
             if candidate.actor_type != "user" {
-                store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
+                store.advance_lpr_correlation_not_before(tid, now_ms)?;
                 let detail = serde_json::json!({
                     "reason": "visitor-backed LPR evidence requires manual resident association",
                     "plate": candidate.plate,
@@ -864,13 +720,13 @@ async fn maybe_correlate_lpr(
                 })
                 .to_string();
                 store.record_lpr_correlation_audit(
-                    &observation.tid,
+                    tid,
                     &observation.epc,
                     "lpr-correlation-visitor",
                     &detail,
                 )?;
                 info!(
-                    tid = %observation.tid,
+                    %tid,
                     plate = %candidate.plate,
                     visitor_id = %candidate.actor_id,
                     "visitor-backed LPR evidence requires manual resident association"
@@ -880,7 +736,7 @@ async fn maybe_correlate_lpr(
             let user = match unifi.validate_claim_user(&candidate.actor_id).await {
                 Ok(user) => user,
                 Err(error) => {
-                    store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
+                    store.advance_lpr_correlation_not_before(tid, now_ms)?;
                     let detail = serde_json::json!({
                         "reason": error.to_string(),
                         "plate": candidate.plate,
@@ -888,13 +744,13 @@ async fn maybe_correlate_lpr(
                     })
                     .to_string();
                     store.record_lpr_correlation_audit(
-                        &observation.tid,
+                        tid,
                         &observation.epc,
                         "lpr-correlation-ambiguous",
                         &detail,
                     )?;
                     warn!(
-                        tid = %observation.tid,
+                        %tid,
                         %error,
                         "LPR user failed the ownership eligibility check; a new plate event will be required"
                     );
@@ -910,14 +766,14 @@ async fn maybe_correlate_lpr(
             .to_string();
             if config.lpr_correlation_mode == LprCorrelationMode::DryRun {
                 store.record_lpr_correlation_audit(
-                    &observation.tid,
+                    tid,
                     &observation.epc,
                     "lpr-correlation-dry-run",
                     &detail,
                 )?;
-                store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
+                store.advance_lpr_correlation_not_before(tid, now_ms)?;
                 info!(
-                    tid = %observation.tid,
+                    %tid,
                     plate = %candidate.plate,
                     user = %user.display_name(),
                     "dry run: LPR event would assign RFID tag to existing UniFi user"
@@ -927,7 +783,7 @@ async fn maybe_correlate_lpr(
 
             let vehicle = format!("License plate {}", candidate.plate);
             store.claim_tag(
-                &observation.tid,
+                tid,
                 &user.id,
                 &user.display_name(),
                 Some(&vehicle),
@@ -935,10 +791,9 @@ async fn maybe_correlate_lpr(
             )?;
             // The successful LPR event already opened the gate. Avoid a redundant
             // remote unlock on the same pass when RFID gate mode is also enabled.
-            gate.last_attempts
-                .insert(observation.tid.clone(), Instant::now());
+            gate.last_attempts.insert(tid.to_owned(), Instant::now());
             info!(
-                tid = %observation.tid,
+                %tid,
                 plate = %candidate.plate,
                 user = %user.display_name(),
                 "assigned RFID tag to the existing UniFi user matched by Entry Gate LPR"
@@ -1061,31 +916,6 @@ async fn maybe_unlock_gate_identity(
     Ok(())
 }
 
-fn status(limit: usize) -> Result<()> {
-    let store = Store::open(&state_db_path(), "status")?;
-    println!("SEQUENCE\tSTATUS\tATTEMPTS\tTID\tEPC\tLAST ERROR");
-    for encoding in store.list(limit)? {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            encoding.sequence,
-            encoding.status,
-            encoding.attempts,
-            encoding.tid,
-            encoding.assigned_epc,
-            encoding.last_error.as_deref().unwrap_or("")
-        );
-    }
-    Ok(())
-}
-
-fn retry(tid: &str) -> Result<()> {
-    let tid = normalize_hex(tid, None, "TID")?;
-    let mut store = Store::open(&state_db_path(), "manual-cli")?;
-    store.retry(&tid)?;
-    println!("reset {tid} for a controlled retry");
-    Ok(())
-}
-
 fn gate_events(limit: usize) -> Result<()> {
     let store = Store::open(&state_db_path(), "status")?;
     println!("TIMESTAMP\tMODE\tDECISION\tTID\tEPC\tUNIFI USER\tDETAIL");
@@ -1110,7 +940,7 @@ fn discovery_status(limit: usize) -> Result<()> {
     println!(
         "STATUS\tIDENTITY\tEPC\tPLATE\tMATCHES\tDAYS\tPASSAGES\tCONFIDENCE\tCONFLICTS\tLPR ACTOR TYPE\tLPR ACTOR ID"
     );
-    for mut candidate in store.list_discovery_candidates(
+    for candidate in store.list_discovery_candidates(
         limit.clamp(1, 500),
         config.discovery_evidence_retention,
         config.discovery_min_occurrences,
@@ -1118,11 +948,6 @@ fn discovery_status(limit: usize) -> Result<()> {
         config.discovery_min_confidence_percent,
         config.discovery_conflict_occurrences,
     )? {
-        if candidate.identity_kind == "epc"
-            && candidate.matched_occurrences < config.discovery_min_occurrences.max(5)
-        {
-            candidate.ready = false;
-        }
         print_discovery_candidate(&candidate);
     }
     Ok(())
@@ -1178,12 +1003,7 @@ async fn associate_discovered_with(
             config.discovery_conflict_occurrences,
         )?
         .with_context(|| format!("discovered tag {tag_key} has no correlated LPR evidence"))?;
-    let minimum_occurrences = if candidate.identity_kind == "epc" {
-        config.discovery_min_occurrences.max(5)
-    } else {
-        config.discovery_min_occurrences
-    };
-    if !candidate.ready || candidate.matched_occurrences < minimum_occurrences {
+    if !candidate.ready || candidate.matched_occurrences < config.discovery_min_occurrences {
         anyhow::bail!(
             "discovered tag {tag_key} has not met the configured occurrence, day, confidence, and conflict thresholds"
         );
@@ -1246,10 +1066,7 @@ fn normalize_discovery_key(value: &str) -> Result<String> {
         .get(..4)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("EPC:"))
     {
-        return Ok(format!(
-            "EPC:{}",
-            normalize_hex(&value[4..], None, "EPC discovery key")?
-        ));
+        anyhow::bail!("EPC discovery keys are no longer supported; use the tag TID");
     }
     normalize_hex(value, None, "TID discovery key")
 }
@@ -1278,6 +1095,7 @@ mod tests {
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
+    use fcr_rfid_encoder::store::now_ms;
 
     const USER_ID: &str = "17d2f099-99df-429b-becb-1399a6937e5a";
     const DOOR_ID: &str = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
@@ -1412,17 +1230,7 @@ mod tests {
             antenna_port: 1,
             transmit_power_cdbm: 3000,
             rf_mode: 4,
-            writes_enabled: false,
-            default_epc: "300833B2DDD9014000000000".into(),
-            epc_prefix: None,
-            min_rssi_cdbm: -5000,
-            confirm_reads: 5,
-            confirm_window: Duration::from_secs(1),
-            access_timeout: Duration::from_secs(15),
-            retry_cooldown: Duration::from_secs(3),
-            max_attempts: 3,
             state_db: db,
-            tag_access_password: None,
             actor: "test".into(),
             web_enabled: false,
             health_enabled: false,
@@ -1454,11 +1262,11 @@ mod tests {
         }
     }
 
-    fn assigned_tag(store: &mut Store) -> TagObservation {
+    fn assigned_tag(store: &mut Store) -> DiscoveryObservation {
         let observation = unassigned_tag(store);
         store
             .claim_tag(
-                &observation.tid,
+                &observation.tag_key,
                 USER_ID,
                 "Example User",
                 None,
@@ -1468,21 +1276,16 @@ mod tests {
         observation
     }
 
-    fn unassigned_tag(store: &mut Store) -> TagObservation {
-        let encoding = store.allocate("E2801111", "FCA7000100000000").unwrap();
+    fn unassigned_tag(store: &mut Store) -> DiscoveryObservation {
+        let observation = discovered_tid("E2801111", "300833B2DDD9014000000000");
         store
-            .mark_completed(&encoding.tid, &encoding.assigned_epc)
+            .register_observed_tid(
+                &observation.tag_key,
+                &observation.epc,
+                observation.peak_rssi_cdbm,
+            )
             .unwrap();
-        store
-            .record_seen(&encoding.tid, &encoding.assigned_epc, -4200)
-            .unwrap();
-        TagObservation {
-            tid: encoding.tid,
-            epc: encoding.assigned_epc,
-            antenna_port: 1,
-            peak_rssi_cdbm: -4200,
-            access_responses: Vec::new(),
-        }
+        observation
     }
 
     fn discovered_tid(tag_key: &str, epc: &str) -> DiscoveryObservation {
@@ -1605,7 +1408,7 @@ mod tests {
             &dry_run,
             &mut gate,
             &mut store,
-            &observation.tid,
+            &observation.tag_key,
             &observation.epc,
         )
         .await
@@ -1633,7 +1436,7 @@ mod tests {
             &live,
             &mut live_gate,
             &mut store,
-            &observation.tid,
+            &observation.tag_key,
             &observation.epc,
         )
         .await
@@ -1666,7 +1469,7 @@ mod tests {
             &config,
             &mut gate,
             &mut store,
-            &observation.tid,
+            &observation.tag_key,
             &observation.epc,
         )
         .await
@@ -1712,10 +1515,15 @@ mod tests {
         maybe_correlate_lpr(&config, &mut gate, &mut store, &observation)
             .await
             .unwrap();
-        assert!(store.get_active_owner(&observation.tid).unwrap().is_none());
         assert!(
             store
-                .lpr_correlation_not_before_ms(&observation.tid)
+                .get_active_owner(&observation.tag_key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .lpr_correlation_not_before_ms(&observation.tag_key)
                 .unwrap()
                 .is_some()
         );
@@ -1744,7 +1552,10 @@ mod tests {
             .await
             .unwrap();
 
-        let owner = store.get_active_owner(&observation.tid).unwrap().unwrap();
+        let owner = store
+            .get_active_owner(&observation.tag_key)
+            .unwrap()
+            .unwrap();
         assert_eq!(owner.unifi_user_id, USER_ID);
         assert_eq!(
             owner.vehicle_description.as_deref(),
@@ -2049,7 +1860,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn associate_discovered_rejects_user_backed_and_weak_epc_candidates() {
+    async fn associate_discovered_rejects_user_backed_and_epc_candidates() {
         let (base_url, counts, server) = mock_unifi(true).await;
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
@@ -2085,7 +1896,7 @@ mod tests {
         assert!(
             epc_error
                 .to_string()
-                .contains("has not met the configured occurrence")
+                .contains("EPC discovery keys are no longer supported")
         );
         assert_eq!(counts.user_reads.load(Ordering::SeqCst), 0);
         server.abort();
