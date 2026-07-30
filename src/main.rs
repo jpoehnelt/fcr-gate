@@ -11,6 +11,7 @@ use fcr_rfid_encoder::{
     engine::{Action, Engine},
     impinj::ImpinjClient,
     model::{DiscoveryObservation, ReaderEvent, TagObservation},
+    plate::same_plate_family,
     store::{
         DiscoveryCandidate, DiscoverySeen, PassageMatchOutcome, PendingDiscoveryPassage, Store,
         now_ms,
@@ -556,7 +557,7 @@ async fn match_discovery_passage(
         }
         if assignment.lpr_actor_type == lpr_match.actor_type
             && assignment.lpr_actor_id == lpr_match.actor_id
-            && assignment.plate == lpr_match.plate
+            && same_plate_family(&assignment.plate, &lpr_match.plate)
         {
             if config.discovery_mode == LprCorrelationMode::Live {
                 store.renew_discovered_lease(

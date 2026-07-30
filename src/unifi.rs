@@ -10,7 +10,7 @@ use reqwest::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 
-use crate::config::Config;
+use crate::{config::Config, plate::canonical_plate_key};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const USERS_PER_PAGE: usize = 100;
@@ -549,13 +549,14 @@ fn correlate_lpr_hits(
         if timestamp <= since || timestamp > until {
             continue;
         }
-        let plate = authentication.issuer.trim().to_ascii_uppercase();
-        if plate.is_empty() {
+        let plate = authentication.issuer.clone();
+        if plate.trim().is_empty() {
             return Ok(LprCorrelation::Ambiguous {
                 reason: "an Entry Gate plate event omitted its plate".into(),
             });
         }
-        plates.insert(plate.clone());
+        let plate_key = canonical_plate_key(&plate);
+        plates.insert(plate_key.clone());
 
         let Some(event) = &hit.source.event else {
             return Ok(LprCorrelation::Ambiguous {
@@ -583,7 +584,7 @@ fn correlate_lpr_hits(
             continue;
         }
         let actor_id = actor.id.trim().to_ascii_lowercase();
-        identity_pairs.insert((actor_type.clone(), actor_id.clone(), plate.clone()));
+        identity_pairs.insert((actor_type.clone(), actor_id.clone(), plate_key));
         matches.push(LprIdentityMatch {
             actor_type,
             actor_id,
@@ -613,7 +614,7 @@ fn correlate_lpr_hits(
             ),
         });
     }
-    let Some((actor_type, actor_id, plate)) = identity_pairs.into_iter().next() else {
+    let Some((actor_type, actor_id, plate_key)) = identity_pairs.into_iter().next() else {
         return Ok(LprCorrelation::NoMatch);
     };
     let matched = matches
@@ -621,7 +622,7 @@ fn correlate_lpr_hits(
         .filter(|candidate| {
             candidate.actor_type == actor_type
                 && candidate.actor_id == actor_id
-                && candidate.plate == plate
+                && canonical_plate_key(&candidate.plate) == plate_key
         })
         .max_by_key(|candidate| candidate.timestamp)
         .context("matched UniFi LPR identity had no source event")?;
@@ -820,7 +821,40 @@ mod tests {
             LprCorrelation::Match(LprIdentityMatch {
                 actor_type: "user".into(),
                 actor_id: user.into(),
-                plate: "ABC123".into(),
+                plate: "abc123".into(),
+                timestamp: Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 11).unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn common_ocr_variants_for_one_identity_are_one_match() {
+        let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let visitor = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let hits = vec![
+            lpr_hit(
+                "2026-07-19T12:00:10Z",
+                "ABOI",
+                "ACCESS",
+                Some(("visitor", visitor)),
+                door,
+            ),
+            lpr_hit(
+                "2026-07-19T12:00:11Z",
+                " ab01 ",
+                "ACCESS",
+                Some(("visitor", visitor)),
+                door,
+            ),
+        ];
+        let (since, until) = lpr_window();
+
+        assert_eq!(
+            correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
+            LprCorrelation::Match(LprIdentityMatch {
+                actor_type: "visitor".into(),
+                actor_id: visitor.into(),
+                plate: " ab01 ".into(),
                 timestamp: Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 11).unwrap(),
             })
         );

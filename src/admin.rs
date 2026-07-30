@@ -10,6 +10,8 @@ use reqwest::{Client, Method, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::plate::canonical_plate_key;
+
 const DEFAULT_UNIFI_ACCESS_HOST: &str = "https://100.89.168.42:12445";
 const DEFAULT_ENTRY_GATE_DOOR_ID: &str = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -423,7 +425,7 @@ pub fn build_plate_groups(plates: &[String]) -> Vec<PlateGroup> {
     let mut groups = HashMap::<String, BTreeSet<String>>::new();
     for plate in counts.keys() {
         groups
-            .entry(canonical_plate(plate))
+            .entry(canonical_plate_key(plate))
             .or_default()
             .insert(plate.clone());
     }
@@ -453,13 +455,6 @@ pub fn build_plate_groups(plates: &[String]) -> Vec<PlateGroup> {
             .then_with(|| left.canonical.cmp(&right.canonical))
     });
     plan
-}
-
-fn canonical_plate(plate: &str) -> String {
-    plate
-        .to_ascii_uppercase()
-        .replace('O', "0")
-        .replace('I', "1")
 }
 
 pub fn visitor_payload(group: &PlateGroup, door_id: &str, start: i64, end: i64) -> Value {

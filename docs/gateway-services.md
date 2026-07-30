@@ -161,6 +161,10 @@ plate identity. UniFi may identify that actor as either a permanent `user` or a
 temporary `visitor`; the actor type and ID are retained with the plate so they
 cannot be conflated. Unmatched and ambiguous passages remain evidence against
 confidence rather than disappearing. Blocked plate reads never count as a match.
+For evidence grouping, case differences and the common `O`/`0` and `I`/`1` OCR
+substitutions are treated as one plate family when the UniFi actor also matches.
+The original plate reported on every passage remains unchanged in SQLite for
+audit. Other one-character differences remain distinct and can become conflicts.
 The matching window is anchored to the R700 event timestamp, so delayed buffered
 reads cannot match a current vehicle.
 
