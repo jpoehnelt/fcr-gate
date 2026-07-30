@@ -549,8 +549,8 @@ fn correlate_lpr_hits(
         if timestamp <= since || timestamp > until {
             continue;
         }
-        let plate = authentication.issuer.trim().to_ascii_uppercase();
-        if plate.is_empty() {
+        let plate = authentication.issuer.clone();
+        if plate.trim().is_empty() {
             return Ok(LprCorrelation::Ambiguous {
                 reason: "an Entry Gate plate event omitted its plate".into(),
             });
@@ -821,7 +821,7 @@ mod tests {
             LprCorrelation::Match(LprIdentityMatch {
                 actor_type: "user".into(),
                 actor_id: user.into(),
-                plate: "ABC123".into(),
+                plate: "abc123".into(),
                 timestamp: Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 11).unwrap(),
             })
         );
@@ -841,7 +841,7 @@ mod tests {
             ),
             lpr_hit(
                 "2026-07-19T12:00:11Z",
-                "AB01",
+                " ab01 ",
                 "ACCESS",
                 Some(("visitor", visitor)),
                 door,
@@ -854,7 +854,7 @@ mod tests {
             LprCorrelation::Match(LprIdentityMatch {
                 actor_type: "visitor".into(),
                 actor_id: visitor.into(),
-                plate: "AB01".into(),
+                plate: " ab01 ".into(),
                 timestamp: Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 11).unwrap(),
             })
         );
