@@ -127,17 +127,13 @@ impl ImpinjClient {
             .context("invalid reader status response")?;
         if status.interface != "IoT" {
             bail!(
-                "reader interface is {}; select the Impinj IoT Device Interface before running the encoder",
+                "reader interface is {}; select the Impinj IoT Device Interface before running the RFID service",
                 status.interface
             );
         }
         if status.status.as_deref() == Some("no region") {
             bail!("reader has no regulatory region configured");
         }
-        if config.writes_enabled {
-            self.ensure_tag_access_supported().await?;
-        }
-
         match status.status.as_deref() {
             Some("running" | "armed") => {
                 let active = status
@@ -213,27 +209,6 @@ impl ImpinjClient {
         Ok(())
     }
 
-    pub async fn queue_epc_write(
-        &self,
-        tid: &str,
-        epc: &str,
-        access_password: Option<&str>,
-    ) -> Result<()> {
-        let payload = build_access_request(tid, epc, access_password)?;
-        let response = self
-            .authorized(
-                self.http
-                    .post(self.url("/profiles/inventory/tag-access"))
-                    .timeout(REQUEST_TIMEOUT)
-                    .json(&payload),
-            )
-            .send()
-            .await
-            .context("failed to queue tag access request")?;
-        expect(response, &[StatusCode::ACCEPTED], "queue tag access").await?;
-        Ok(())
-    }
-
     pub async fn stream_events(self, sender: mpsc::Sender<ReaderEvent>) {
         let mut backoff = Duration::from_secs(1);
         loop {
@@ -297,32 +272,6 @@ impl ImpinjClient {
         }
     }
 
-    async fn ensure_tag_access_supported(&self) -> Result<()> {
-        let document: Value = self
-            .authorized(
-                self.http
-                    .get(self.url("/openapi.json"))
-                    .timeout(REQUEST_TIMEOUT),
-            )
-            .send()
-            .await
-            .context("failed to retrieve reader OpenAPI document")?
-            .error_for_status()
-            .context("reader OpenAPI request failed")?
-            .json()
-            .await
-            .context("invalid reader OpenAPI response")?;
-        if document
-            .pointer("/paths/~1profiles~1inventory~1tag-access/post")
-            .is_none()
-        {
-            bail!(
-                "reader firmware does not expose /profiles/inventory/tag-access; update to a firmware/API version that supports tag-memory encoding"
-            );
-        }
-        Ok(())
-    }
-
     fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         request.basic_auth(&self.username, Some(&self.password))
     }
@@ -373,58 +322,6 @@ pub fn build_inventory_request(config: &Config) -> Value {
     })
 }
 
-pub fn build_access_request(tid: &str, epc: &str, access_password: Option<&str>) -> Result<Value> {
-    if tid.is_empty()
-        || tid.len() % 2 != 0
-        || tid.len() * 4 > 255
-        || !tid.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        bail!("TID must be complete hexadecimal bytes no longer than 255 bits");
-    }
-    if epc.len() != 24 || !epc.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("assigned EPC must be exactly 96 bits (24 hexadecimal characters)");
-    }
-
-    let mut access_commands = Vec::with_capacity(7);
-    for (index, word) in epc.as_bytes().chunks_exact(4).enumerate() {
-        let word = std::str::from_utf8(word).expect("validated hexadecimal is UTF-8");
-        access_commands.push(json!({
-            "identifier": format!("write-epc-{index}"),
-            "write": {
-                "memoryBank": "epc",
-                "wordOffset": 2 + index,
-                "dataHex": word.to_ascii_uppercase()
-            }
-        }));
-    }
-    access_commands.push(json!({
-        "identifier": "verify-epc",
-        "read": {
-            "memoryBank": "epc",
-            "wordOffset": 2,
-            "wordCount": 6
-        }
-    }));
-
-    let mut configuration = json!({
-        "tagSelectors": [{
-            "action": "include",
-            "tagMemoryBank": "tid",
-            "bitOffset": 0,
-            "mask": tid.to_ascii_uppercase(),
-            "maskLength": tid.len() * 4
-        }],
-        "accessCommands": access_commands
-    });
-    if let Some(password) = access_password {
-        if password.len() != 8 || !password.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            bail!("tag access password must be exactly 32 bits (8 hexadecimal characters)");
-        }
-        configuration["tagAccessPasswordHex"] = json!(password.to_ascii_uppercase());
-    }
-    Ok(json!({ "accessConfigurations": [configuration] }))
-}
-
 async fn expect(response: Response, allowed: &[StatusCode], operation: &str) -> Result<Response> {
     if allowed.contains(&response.status()) {
         return Ok(response);
@@ -438,34 +335,6 @@ async fn expect(response: Response, allowed: &[StatusCode], operation: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn access_request_targets_tid_and_writes_six_words() {
-        let payload =
-            build_access_request("E28011606000020497CB0065", "FCA700010000000000000001", None)
-                .unwrap();
-        let configuration = &payload["accessConfigurations"][0];
-        assert_eq!(configuration["tagSelectors"][0]["tagMemoryBank"], "tid");
-        assert_eq!(configuration["tagSelectors"][0]["bitOffset"], 0);
-        assert_eq!(configuration["tagSelectors"][0]["maskLength"], 96);
-        let commands = configuration["accessCommands"].as_array().unwrap();
-        assert_eq!(commands.len(), 7);
-        assert_eq!(commands[0]["write"]["wordOffset"], 2);
-        assert_eq!(commands[5]["write"]["wordOffset"], 7);
-        assert_eq!(commands[6]["read"]["wordCount"], 6);
-    }
-
-    #[test]
-    fn access_request_rejects_an_invalid_password() {
-        assert!(
-            build_access_request(
-                "E28011606000020497CB0065",
-                "FCA700010000000000000001",
-                Some("not-hex")
-            )
-            .is_err()
-        );
-    }
 
     #[test]
     fn reader_health_tracks_connection_and_recent_activity() {

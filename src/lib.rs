@@ -1,6 +1,5 @@
 pub mod admin;
 pub mod config;
-pub mod engine;
 pub mod impinj;
 pub mod model;
 pub mod plate;

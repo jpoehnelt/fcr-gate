@@ -3,7 +3,7 @@ name = "fcr-rfid-encoder"
 version = "2026.7.29"
 edition = "2024"
 rust-version = "1.85"
-description = "FCR Gate UniFi Access admin CLI and Impinj R700 encoder service"
+description = "FCR Gate UniFi Access admin CLI and Impinj R700 TID service"
 license = "MIT"
 
 [dependencies]

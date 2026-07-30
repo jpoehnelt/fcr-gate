@@ -7,7 +7,6 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-pub const DEFAULT_UNENCODED_EPC: &str = "300833B2DDD9014000000000";
 pub const DEFAULT_UNIFI_ACCESS_HOST: &str = "https://100.89.168.42:12445";
 pub const DEFAULT_ENTRY_GATE_DOOR_ID: &str = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
 
@@ -64,17 +63,7 @@ pub struct Config {
     pub antenna_port: u16,
     pub transmit_power_cdbm: i32,
     pub rf_mode: u16,
-    pub writes_enabled: bool,
-    pub default_epc: String,
-    pub epc_prefix: Option<String>,
-    pub min_rssi_cdbm: i32,
-    pub confirm_reads: u32,
-    pub confirm_window: Duration,
-    pub access_timeout: Duration,
-    pub retry_cooldown: Duration,
-    pub max_attempts: u32,
     pub state_db: PathBuf,
-    pub tag_access_password: Option<String>,
     pub actor: String,
     pub web_enabled: bool,
     pub health_enabled: bool,
@@ -116,27 +105,12 @@ impl Config {
         if ca_certificate.is_some() && !verify_tls {
             bail!("IMPINJ_CA_CERTIFICATE requires IMPINJ_TLS_VERIFY=true");
         }
-
-        let writes_enabled = boolean("RFID_WRITES_ENABLED", false)?;
-        let default_epc = normalize_hex(
-            &env::var("RFID_DEFAULT_EPC").unwrap_or_else(|_| DEFAULT_UNENCODED_EPC.into()),
-            Some(24),
-            "RFID_DEFAULT_EPC",
-        )?;
-        let epc_prefix = env::var("RFID_EPC_PREFIX")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| normalize_hex(&value, Some(16), "RFID_EPC_PREFIX"))
-            .transpose()?;
-        if writes_enabled && epc_prefix.is_none() {
-            bail!("RFID_EPC_PREFIX is required when RFID_WRITES_ENABLED=true");
+        if boolean("RFID_WRITES_ENABLED", false)? {
+            bail!(
+                "RFID_WRITES_ENABLED=true is no longer supported; the service identifies tags by TID and never writes EPC memory"
+            );
         }
 
-        let tag_access_password = env::var("IMPINJ_TAG_ACCESS_PASSWORD")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| normalize_hex(&value, Some(8), "IMPINJ_TAG_ACCESS_PASSWORD"))
-            .transpose()?;
         let profile_id = validate_profile_id(
             &env::var("IMPINJ_PROFILE_ID").unwrap_or_else(|_| "fcr-gate-encoder".into()),
         )?;
@@ -221,20 +195,7 @@ impl Config {
             antenna_port: number("IMPINJ_ANTENNA_PORT", 1)?,
             transmit_power_cdbm: number("IMPINJ_TX_POWER_CDBM", 3000)?,
             rf_mode: number("IMPINJ_RF_MODE", 4)?,
-            writes_enabled,
-            default_epc,
-            epc_prefix,
-            min_rssi_cdbm: number("RFID_MIN_RSSI_CDBM", -5000)?,
-            confirm_reads: positive_number("RFID_CONFIRM_READS", 5)?,
-            confirm_window: Duration::from_millis(positive_number("RFID_CONFIRM_WINDOW_MS", 1500)?),
-            access_timeout: Duration::from_millis(positive_number(
-                "RFID_ACCESS_TIMEOUT_MS",
-                15_000,
-            )?),
-            retry_cooldown: Duration::from_millis(positive_number("RFID_RETRY_COOLDOWN_MS", 3000)?),
-            max_attempts: positive_number("RFID_MAX_ATTEMPTS", 3)?,
             state_db: state_db_path(),
-            tag_access_password,
             actor: env::var("RFID_ENCODER_ACTOR").unwrap_or_else(|_| "gate-auto".into()),
             web_enabled,
             health_enabled,
