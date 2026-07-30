@@ -9,8 +9,16 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
+use crate::plate::{canonical_plate_key, same_plate_family};
+
 type DiscoveryIdentityKey = (String, String, String);
-type DiscoveryEvidence = (u32, HashSet<i64>, i64);
+
+struct DiscoveryEvidence {
+    plate: String,
+    matched_occurrences: u32,
+    days: HashSet<i64>,
+    last_match_ms: i64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Encoding {
@@ -659,21 +667,12 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: (String, Option<i64>, Option<String>, Option<String>, String) = transaction
+        let existing: (String, Option<String>, Option<String>, String) = transaction
             .query_row(
-                "SELECT correlation_status, lpr_event_ms, plate, lpr_actor_id,
-                        lpr_actor_type
+                "SELECT correlation_status, plate, lpr_actor_id, lpr_actor_type
                  FROM discovery_passages WHERE id = ?1 AND stationary = 0",
                 [passage_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .with_context(|| format!("unknown or stationary discovery passage {passage_id}"))?;
         let outcome = match existing.0.as_str() {
@@ -694,10 +693,12 @@ impl Store {
                 PassageMatchOutcome::Recorded
             }
             "matched"
-                if existing.1 == Some(lpr_event_ms)
-                    && existing.2.as_deref() == Some(plate)
-                    && existing.3.as_deref() == Some(lpr_actor_id)
-                    && existing.4 == lpr_actor_type =>
+                if existing
+                    .1
+                    .as_deref()
+                    .is_some_and(|stored| same_plate_family(stored, plate))
+                    && existing.2.as_deref() == Some(lpr_actor_id)
+                    && existing.3 == lpr_actor_type =>
             {
                 PassageMatchOutcome::Duplicate
             }
@@ -782,11 +783,19 @@ impl Store {
                 continue;
             };
             let entry = groups
-                .entry((plate, actor_type, actor_id))
-                .or_insert_with(|| (0, HashSet::new(), event_ms));
-            entry.0 = entry.0.saturating_add(1);
-            entry.1.insert(event_ms.div_euclid(86_400_000));
-            entry.2 = entry.2.max(event_ms);
+                .entry((canonical_plate_key(&plate), actor_type, actor_id))
+                .or_insert_with(|| DiscoveryEvidence {
+                    plate: plate.clone(),
+                    matched_occurrences: 0,
+                    days: HashSet::new(),
+                    last_match_ms: event_ms,
+                });
+            entry.matched_occurrences = entry.matched_occurrences.saturating_add(1);
+            entry.days.insert(event_ms.div_euclid(86_400_000));
+            if event_ms >= entry.last_match_ms {
+                entry.plate = plate;
+                entry.last_match_ms = event_ms;
+            }
         }
         if groups.is_empty() {
             return Ok(None);
@@ -795,16 +804,23 @@ impl Store {
         ranked.sort_by(|left, right| {
             right
                 .1
-                .0
-                .cmp(&left.1.0)
-                .then_with(|| right.1.2.cmp(&left.1.2))
+                .matched_occurrences
+                .cmp(&left.1.matched_occurrences)
+                .then_with(|| right.1.last_match_ms.cmp(&left.1.last_match_ms))
                 .then_with(|| left.0.cmp(&right.0))
         });
-        let ((plate, lpr_actor_type, lpr_actor_id), (matched_occurrences, days, last_match_ms)) =
-            ranked.remove(0);
+        let (
+            (_, lpr_actor_type, lpr_actor_id),
+            DiscoveryEvidence {
+                plate,
+                matched_occurrences,
+                days,
+                last_match_ms,
+            },
+        ) = ranked.remove(0);
         let conflicting_occurrences = ranked
             .iter()
-            .map(|(_, (count, _, _))| *count)
+            .map(|(_, evidence)| evidence.matched_occurrences)
             .max()
             .unwrap_or(0);
         let confidence_percent = u8::try_from(
@@ -959,7 +975,7 @@ impl Store {
         if let Some((status, user_id, plate, actor_type, actor_id)) = existing {
             if status == "active"
                 && user_id == unifi_user_id
-                && plate == candidate.plate
+                && same_plate_family(&plate, &candidate.plate)
                 && actor_type == candidate.lpr_actor_type
                 && actor_id == candidate.lpr_actor_id
             {
@@ -1029,19 +1045,21 @@ impl Store {
         plate: &str,
         lease: Duration,
     ) -> Result<bool> {
+        let Some(assignment) = self.learned_assignment(tag_key)? else {
+            return Ok(false);
+        };
+        if assignment.status != "active"
+            || assignment.lpr_actor_type != lpr_actor_type
+            || assignment.lpr_actor_id != lpr_actor_id
+            || !same_plate_family(&assignment.plate, plate)
+        {
+            return Ok(false);
+        }
         let expires_ms = now_ms().saturating_add(duration_ms(lease));
         let changed = self.connection.execute(
             "UPDATE learned_tag_ownership SET lease_expires_ms = ?1, updated_at = ?2
-             WHERE tag_key = ?3 AND status = 'active'
-               AND lpr_actor_type = ?4 AND lpr_actor_id = ?5 AND plate = ?6",
-            params![
-                expires_ms,
-                timestamp(),
-                tag_key,
-                lpr_actor_type,
-                lpr_actor_id,
-                plate
-            ],
+             WHERE tag_key = ?3 AND status = 'active'",
+            params![expires_ms, timestamp(), tag_key],
         )?;
         Ok(changed > 0)
     }
@@ -1055,14 +1073,31 @@ impl Store {
         evidence_retention: Duration,
     ) -> Result<u32> {
         let cutoff = now_ms().saturating_sub(duration_ms(evidence_retention));
-        let count: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM discovery_passages
+        let mut statement = self.connection.prepare(
+            "SELECT lpr_actor_type, lpr_actor_id, plate
+             FROM discovery_passages
              WHERE tag_key = ?1 AND started_at_ms >= ?2 AND stationary = 0
-               AND correlation_status = 'matched'
-               AND (lpr_actor_type IS NOT ?3 OR lpr_actor_id IS NOT ?4 OR plate IS NOT ?5)",
-            params![tag_key, cutoff, lpr_actor_type, lpr_actor_id, plate],
-            |row| row.get(0),
+               AND correlation_status = 'matched'",
         )?;
+        let rows = statement
+            .query_map(params![tag_key, cutoff], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let count = rows
+            .into_iter()
+            .filter(|(actor_type, actor_id, observed_plate)| {
+                actor_type != lpr_actor_type
+                    || actor_id.as_deref() != Some(lpr_actor_id)
+                    || observed_plate
+                        .as_deref()
+                        .is_none_or(|observed| !same_plate_family(observed, plate))
+            })
+            .count();
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
@@ -2169,6 +2204,18 @@ mod tests {
                 .unwrap(),
             PassageMatchOutcome::Duplicate
         );
+        assert_eq!(
+            store
+                .record_discovery_match(
+                    first.passage_id,
+                    base + 750,
+                    "ABCI23",
+                    "user",
+                    "17d2f099-99df-429b-becb-1399a6937e5a",
+                )
+                .unwrap(),
+            PassageMatchOutcome::Duplicate
+        );
         let candidate = store
             .discovery_candidate(tag, Duration::from_secs(60 * 86_400), 1, 1, 100, 2)
             .unwrap()
@@ -2176,6 +2223,58 @@ mod tests {
         assert_eq!(candidate.total_passages, 1);
         assert_eq!(candidate.matched_occurrences, 1);
         assert_eq!(candidate.confidence_percent, 100);
+    }
+
+    #[test]
+    fn common_ocr_plate_variants_build_and_renew_one_candidate() {
+        let directory = tempdir().unwrap();
+        let mut store = Store::open(&directory.path().join("state.sqlite3"), "test").unwrap();
+        let tag = "E2801111";
+        let epc = "11223344556677889900AABB";
+        let visitor = "27d2f099-99df-429b-becb-1399a6937e5b";
+        let user = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let first_at = now_ms() - 2 * 86_400_000;
+        let second_at = first_at + 86_400_000;
+
+        let first = discovery_seen(&mut store, tag, epc, first_at);
+        store
+            .record_discovery_match(first.passage_id, first_at, "ABOI", "visitor", visitor)
+            .unwrap();
+        let second = discovery_seen(&mut store, tag, epc, second_at);
+        store
+            .record_discovery_match(second.passage_id, second_at, "AB01", "visitor", visitor)
+            .unwrap();
+
+        let candidate = store
+            .discovery_candidate(tag, Duration::from_secs(60 * 86_400), 2, 2, 100, 2)
+            .unwrap()
+            .unwrap();
+        assert!(candidate.ready);
+        assert_eq!(candidate.plate, "AB01");
+        assert_eq!(candidate.matched_occurrences, 2);
+        assert_eq!(candidate.distinct_days, 2);
+        assert_eq!(candidate.conflicting_occurrences, 0);
+        assert_eq!(
+            store
+                .count_discovery_conflicts(
+                    tag,
+                    "visitor",
+                    visitor,
+                    "ABOI",
+                    Duration::from_secs(60 * 86_400),
+                )
+                .unwrap(),
+            0
+        );
+
+        store
+            .activate_discovered_tag(&candidate, user, "Example User", Duration::from_secs(60))
+            .unwrap();
+        assert!(
+            store
+                .renew_discovered_lease(tag, "visitor", visitor, "ABOI", Duration::from_secs(120),)
+                .unwrap()
+        );
     }
 
     #[test]

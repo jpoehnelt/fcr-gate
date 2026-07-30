@@ -3,6 +3,7 @@ pub mod config;
 pub mod engine;
 pub mod impinj;
 pub mod model;
+pub mod plate;
 pub mod store;
 pub mod unifi;
 pub mod web;
