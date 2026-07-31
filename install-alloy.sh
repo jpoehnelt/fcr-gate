@@ -149,15 +149,14 @@ getent group alloy >/dev/null 2>&1 || groupadd --system alloy
 if ! id -u alloy >/dev/null 2>&1; then
   useradd --system --gid alloy --home-dir /nonexistent --shell /bin/false alloy
 fi
-journal_group_found=false
-for group in adm systemd-journal; do
-  if getent group "$group" >/dev/null 2>&1; then
-    usermod -a -G "$group" alloy
-    journal_group_found=true
-  fi
-done
-[[ "$journal_group_found" == true ]] ||
+if getent group systemd-journal >/dev/null 2>&1; then
+  journal_group=systemd-journal
+elif getent group adm >/dev/null 2>&1; then
+  journal_group=adm
+else
   die "neither adm nor systemd-journal exists; cannot grant Alloy journal access"
+fi
+usermod -G "$journal_group" alloy
 
 install -d -o alloy -g alloy -m 0750 "$INSTALL_ROOT/alloy-data"
 chown root:alloy "$INSTALL_ROOT/deploy/alloy-fcr-gate.config.alloy"
