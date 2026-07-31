@@ -121,8 +121,12 @@ curl "${curl_args[@]}" --output "$tmpdir/$asset.sha256" "$release_base/$asset.sh
 )
 
 expected_members=(
+  40-alloy-fcr-gate.sh
   30-fcr-rfid-encoder.sh
   VERSION
+  alloy-fcr-gate.config.alloy
+  alloy-fcr-gate.service
+  alloy.env.example
   fcr-gate-admin
   fcr-rfid-encoder
   fcr-rfid-encoder.service
@@ -178,6 +182,14 @@ install -m 0755 "$unpack_dir/30-fcr-rfid-encoder.sh" \
   "$INSTALL_ROOT/deploy/30-fcr-rfid-encoder.sh"
 install -m 0755 "$unpack_dir/30-fcr-rfid-encoder.sh" \
   "$ON_BOOT_DIR/30-fcr-rfid-encoder.sh"
+install -m 0644 "$unpack_dir/alloy-fcr-gate.config.alloy" \
+  "$INSTALL_ROOT/deploy/alloy-fcr-gate.config.alloy"
+install -m 0644 "$unpack_dir/alloy-fcr-gate.service" \
+  "$INSTALL_ROOT/deploy/alloy-fcr-gate.service"
+install -m 0644 "$unpack_dir/alloy.env.example" \
+  "$INSTALL_ROOT/deploy/alloy.env.example"
+install -m 0755 "$unpack_dir/40-alloy-fcr-gate.sh" \
+  "$INSTALL_ROOT/deploy/40-alloy-fcr-gate.sh"
 install -m 0644 "$unpack_dir/VERSION" "$INSTALL_ROOT/VERSION"
 
 environment_file="$INSTALL_ROOT/secrets/gateway.env"

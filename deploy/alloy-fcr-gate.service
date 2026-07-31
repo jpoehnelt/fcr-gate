@@ -1,0 +1,26 @@
+[Unit]
+Description=FCR Gate Grafana Alloy log shipper
+Documentation=https://grafana.com/docs/alloy/
+Wants=network-online.target fcr-rfid-encoder.service
+After=network-online.target fcr-rfid-encoder.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/data/fcr-gate/alloy-data
+EnvironmentFile=/data/fcr-gate/secrets/alloy.env
+ExecStart=/data/fcr-gate/bin/alloy run --storage.path=/data/fcr-gate/alloy-data --server.http.listen-addr=127.0.0.1:12345 /data/fcr-gate/deploy/alloy-fcr-gate.config.alloy
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=-/run/log/journal -/var/log/journal
+ReadWritePaths=/data/fcr-gate/alloy-data
+
+[Install]
+WantedBy=multi-user.target

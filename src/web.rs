@@ -124,7 +124,7 @@ impl ApiError {
     }
 
     fn internal(error: anyhow::Error) -> Self {
-        error!(%error, "operator UI request failed");
+        error!(event = "operator_request_failed", %error, "operator UI request failed");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "internal service error".into(),
@@ -183,10 +183,10 @@ pub async fn start(
             let _ = shutdown_receiver.await;
         });
         if let Err(error) = server.await {
-            error!(%error, "operator UI stopped unexpectedly");
+            error!(event = "operator_service_stopped", %error, "operator UI stopped unexpectedly");
         }
     });
-    info!(%address, "gateway HTTP service listening on loopback");
+    info!(event = "operator_service_listening", %address, "gateway HTTP service listening on loopback");
     Ok(WebHandle {
         shutdown: Some(shutdown_sender),
         task,
@@ -206,14 +206,15 @@ async fn health(State(state): State<AppState>) -> Response {
     } else {
         "stale"
     };
-    let database_ok =
-        match Store::open(&state.db_path, "health").and_then(|store| store.health_check()) {
-            Ok(()) => true,
-            Err(error) => {
-                error!(%error, "health check could not access RFID state database");
-                false
-            }
-        };
+    let database_ok = match Store::open(&state.db_path, "health")
+        .and_then(|store| store.health_check())
+    {
+        Ok(()) => true,
+        Err(error) => {
+            error!(event = "health_database_check_failed", %error, "health check could not access RFID state database");
+            false
+        }
+    };
     let healthy = reader_recent && database_ok;
     let body = HealthResponse {
         status: if healthy { "ok" } else { "unhealthy" },

@@ -173,6 +173,12 @@ curl --fail-with-body http://127.0.0.1:8080/healthz
 The health response contains service, reader, and database status only. It never
 includes tags, users, vehicles, or credentials.
 
+Service logs are newline-delimited JSON in journald. Each operational record has
+a stable `event` field plus relevant values such as `tid`, `epc`, `plate`,
+`decision`, and `reason`. The optional Grafana Alloy deployment ships only the
+`fcr-rfid-encoder.service` journal to Loki; see
+[Loki event inspection](docs/gateway-services.md#loki-event-inspection).
+
 Successful UniFi LPR Visitor events can build durable tag-to-plate evidence, but
 they never become gate owners automatically. A mature `needs-resident` candidate
 must be validated against a permanent UniFi user with `associate-discovered`; the

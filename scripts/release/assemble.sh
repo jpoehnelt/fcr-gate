@@ -25,12 +25,15 @@ for target in "${targets[@]}"; do
 done
 
 install -m 0755 "$repo_root/install.sh" "$dist_dir/install-fcr-gate.sh"
+install -m 0755 "$repo_root/install-alloy.sh" "$dist_dir/install-fcr-gate-alloy.sh"
 (
   cd "$dist_dir"
   sha256sum install-fcr-gate.sh >install-fcr-gate.sh.sha256
+  sha256sum install-fcr-gate-alloy.sh >install-fcr-gate-alloy.sh.sha256
   sha256sum \
     fcr-gate-aarch64-unknown-linux-musl.tar.gz \
     fcr-gate-x86_64-unknown-linux-musl.tar.gz \
+    install-fcr-gate-alloy.sh \
     install-fcr-gate.sh | LC_ALL=C sort -k2 >SHA256SUMS
   sha256sum --check SHA256SUMS
   sha256sum --check -- ./*.sha256
@@ -42,6 +45,8 @@ expected_files=(
   fcr-gate-aarch64-unknown-linux-musl.tar.gz.sha256
   fcr-gate-x86_64-unknown-linux-musl.tar.gz
   fcr-gate-x86_64-unknown-linux-musl.tar.gz.sha256
+  install-fcr-gate-alloy.sh
+  install-fcr-gate-alloy.sh.sha256
   install-fcr-gate.sh
   install-fcr-gate.sh.sha256
 )

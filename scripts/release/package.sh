@@ -44,6 +44,10 @@ install -m 0755 "$binary_dir/fcr-gate-admin" "$stage/fcr-gate-admin"
 install -m 0644 deploy/fcr-rfid-encoder.service "$stage/fcr-rfid-encoder.service"
 install -m 0755 deploy/30-fcr-rfid-encoder.sh "$stage/30-fcr-rfid-encoder.sh"
 install -m 0644 deploy/gateway.env.example "$stage/gateway.env.example"
+install -m 0755 deploy/40-alloy-fcr-gate.sh "$stage/40-alloy-fcr-gate.sh"
+install -m 0644 deploy/alloy-fcr-gate.config.alloy "$stage/alloy-fcr-gate.config.alloy"
+install -m 0644 deploy/alloy-fcr-gate.service "$stage/alloy-fcr-gate.service"
+install -m 0644 deploy/alloy.env.example "$stage/alloy.env.example"
 printf '%s\n' "$tag" >"$stage/VERSION"
 chmod 0644 "$stage/VERSION"
 
@@ -52,7 +56,11 @@ source_date_epoch="${SOURCE_DATE_EPOCH:-$(git show -s --format=%ct HEAD)}"
 
 members=(
   30-fcr-rfid-encoder.sh
+  40-alloy-fcr-gate.sh
   VERSION
+  alloy-fcr-gate.config.alloy
+  alloy-fcr-gate.service
+  alloy.env.example
   fcr-gate-admin
   fcr-rfid-encoder
   fcr-rfid-encoder.service

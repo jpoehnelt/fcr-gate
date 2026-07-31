@@ -272,6 +272,72 @@ The response deliberately excludes TID, EPC, user, vehicle, policy, and error te
 Use a path-specific Cloudflare Access service-token policy for external monitoring,
 or query `http://127.0.0.1:8080/healthz` locally.
 
+## Loki event inspection
+
+The encoder writes newline-delimited JSON to stderr, which systemd stores in the
+journal. Operational events use stable names such as `service_ready`,
+`reader_stream_disconnected`, `rfid_passage_started`, `lpr_correlation_match`, and
+`gate_authorization`. One `rfid_passage_started` record is emitted per passage,
+rather than one record per reader report. TIDs, EPCs, plates, user IDs, errors, and
+RSSI values remain JSON fields so they can be searched without creating
+high-cardinality Loki labels. Keep `RUST_LOG=info` in `gateway.env` to retain
+passage and successful-decision events; `warn` suppresses them.
+
+The release archive includes an optional Alloy configuration that reads only
+`fcr-rfid-encoder.service`. It labels the controlled `level`, `event`, `mode`, and
+`decision` fields, writes through a seven-day local WAL under `/data`, and sends
+batches to a Loki endpoint. Loki outages do not block the RFID event loop or UniFi
+decisions.
+
+After updating FCR Gate to a release containing the Alloy files, create its
+root-only environment file:
+
+```bash
+install -m 0600 /data/fcr-gate/deploy/alloy.env.example \
+  /data/fcr-gate/secrets/alloy.env
+vi /data/fcr-gate/secrets/alloy.env
+```
+
+Set `FCR_GATE_LOKI_URL` to the full Tailscale-reachable push URL, including
+`/loki/api/v1/push`. Then download and review the release installer:
+
+```bash
+curl --fail --location --proto '=https' --tlsv1.2 \
+  --output /tmp/install-fcr-gate-alloy.sh \
+  https://github.com/jpoehnelt/fcr-gate/releases/latest/download/install-fcr-gate-alloy.sh
+less /tmp/install-fcr-gate-alloy.sh
+bash /tmp/install-fcr-gate-alloy.sh
+```
+
+The installer downloads the pinned official Grafana Alloy standalone binary,
+verifies it against Grafana's release checksum manifest, stores it under
+`/data/fcr-gate`, and installs a UniFi boot hook. The dedicated service runs with a
+read-only system view except for its persistent WAL directory. Verify delivery:
+
+```bash
+systemctl status alloy-fcr-gate --no-pager
+journalctl -u alloy-fcr-gate -n 100 --no-pager
+curl --fail http://127.0.0.1:12345/-/ready
+```
+
+Useful LogQL queries:
+
+```logql
+{service_name="fcr-gate"} | json | tid="E2801234"
+```
+
+```logql
+{service_name="fcr-gate", event="lpr_correlation_match"} | json
+```
+
+```logql
+{service_name="fcr-gate", decision=~"denied|error"} | json
+```
+
+SQLite remains the durable source of truth for assignments, evidence, and audit
+records. Loki is the searchable event timeline, while Prometheus remains the right
+place for health, rates, and alerts.
+
 Impinj references:
 
 - IoT Device Interface API: <https://support.impinj.com/article/32195454977555>
@@ -290,13 +356,18 @@ Expected layout on a UniFi OS 4.x/5.x Cloud Gateway:
 /data/fcr-gate/
 ├── bin/
 │   ├── cloudflared
+│   ├── alloy
 │   ├── fcr-gate-admin
 │   └── fcr-rfid-encoder
 ├── deploy/
+│   ├── alloy-fcr-gate.config.alloy
+│   ├── alloy-fcr-gate.service
 │   ├── cloudflared.service
 │   └── fcr-rfid-encoder.service
+├── alloy-data/
 ├── rfid-encoder.sqlite3
 └── secrets/
+    ├── alloy.env
     ├── cloudflare-tunnel-token
     ├── impinj-password
     ├── unifi-access-api-key
@@ -315,7 +386,9 @@ with the example environment and keep the password and environment files mode
 default that keeps writes off.
 
 Tagged GitHub releases automate installation and updates for the FCR Gate binaries
-and encoder service. They do not install or update `cloudflared`. See
+and encoder service. The separate attested Alloy installer downloads and verifies
+Grafana's official binary after the Loki environment file is configured. Releases
+do not install or update `cloudflared`. See
 [Install on the UniFi gateway](../README.md#install-on-the-unifi-gateway) for the
 verified release workflow.
 

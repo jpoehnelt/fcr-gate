@@ -67,6 +67,7 @@ pub struct GateEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoverySeen {
     pub passage_id: i64,
+    pub new_passage: bool,
     pub started_at_ms: i64,
     pub last_seen_ms: i64,
     pub correlation_status: String,
@@ -593,6 +594,7 @@ impl Store {
         transaction.commit()?;
         Ok(DiscoverySeen {
             passage_id,
+            new_passage,
             started_at_ms: session_started_ms,
             last_seen_ms: observed_at_ms,
             correlation_status,
@@ -2178,6 +2180,8 @@ mod tests {
         let base = now_ms() - 86_400_000;
         let first = discovery_seen(&mut store, tag, epc, base);
         let repeated = discovery_seen(&mut store, tag, epc, base + 1_000);
+        assert!(first.new_passage);
+        assert!(!repeated.new_passage);
         assert_eq!(first.passage_id, repeated.passage_id);
 
         assert_eq!(
