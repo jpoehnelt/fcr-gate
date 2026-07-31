@@ -127,9 +127,12 @@ Cloudflare-authenticated operator email in `audit_log`.
 `RFID_LPR_CORRELATION_MODE=dry-run` or `live` can correlate a newly encoded tag
 with an existing permanent UniFi user automatically. The service considers only
 one completed tag that has never been assigned, then reads a short window of
-Entry Gate `LICENSEPLATE` logs. A match requires exactly one plate and one distinct
+Entry Gate `LICENSEPLATE` logs. A match requires the configured Entry Gate door,
+UniFi's `device_config` target set to `entry`, exactly one plate, and one distinct
 successful `ACCESS` user/plate pair whose actor type is `user`, plus an active user
-and an Entry Gate access policy. Repeated reads of that same pair are harmless.
+and an Entry Gate access policy. Exit-side events are ignored; an event with no
+direction marker fails closed as ambiguous. Repeated reads of the same pair are
+harmless.
 Visitor events do not directly assign a newly encoded tag to a permanent user.
 They remain available to multi-visit discovery instead. Blocked-only reads,
 another plate, another unassigned tag, truncated logs, or malformed data do not
