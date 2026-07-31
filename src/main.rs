@@ -1118,7 +1118,7 @@ async fn maybe_unlock_gate_identity(
                 %epc,
                 user_id = %owner.unifi_user_id,
                 %reason,
-                gate_mode = config.gate_mode.as_str(),
+                mode = config.gate_mode.as_str(),
                 "assigned RFID tag denied by current UniFi user policy"
             );
         }
@@ -1138,7 +1138,7 @@ async fn maybe_unlock_gate_identity(
                 %epc,
                 user_id = %owner.unifi_user_id,
                 %error,
-                gate_mode = config.gate_mode.as_str(),
+                mode = config.gate_mode.as_str(),
                 "could not verify current UniFi access; gate remains locked"
             );
             return Err(error.context("could not verify current UniFi access; gate remains locked"));
