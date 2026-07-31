@@ -153,6 +153,8 @@ struct SystemLogTarget {
     id: String,
     #[serde(rename = "type", default)]
     kind: String,
+    #[serde(default)]
+    display_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -549,6 +551,31 @@ fn correlate_lpr_hits(
         if timestamp <= since || timestamp > until {
             continue;
         }
+        let direction_targets = hit
+            .source
+            .target
+            .iter()
+            .filter(|target| target.kind.eq_ignore_ascii_case("device_config"))
+            .collect::<Vec<_>>();
+        if direction_targets.is_empty() {
+            return Ok(LprCorrelation::Ambiguous {
+                reason: "an Entry Gate plate event omitted its entry/exit direction".into(),
+            });
+        }
+        if !direction_targets
+            .iter()
+            .any(|target| target.display_name.trim().eq_ignore_ascii_case("entry"))
+        {
+            continue;
+        }
+        if direction_targets
+            .iter()
+            .any(|target| !target.display_name.trim().eq_ignore_ascii_case("entry"))
+        {
+            return Ok(LprCorrelation::Ambiguous {
+                reason: "an Entry Gate plate event reported conflicting directions".into(),
+            });
+        }
         let plate = authentication.issuer.clone();
         if plate.trim().is_empty() {
             return Ok(LprCorrelation::Ambiguous {
@@ -771,7 +798,25 @@ mod tests {
         actor: Option<(&str, &str)>,
         door_id: &str,
     ) -> SystemLogHit {
+        lpr_hit_with_direction(timestamp, plate, result, actor, door_id, Some("entry"))
+    }
+
+    fn lpr_hit_with_direction(
+        timestamp: &str,
+        plate: &str,
+        result: &str,
+        actor: Option<(&str, &str)>,
+        door_id: &str,
+        direction: Option<&str>,
+    ) -> SystemLogHit {
         let actor = actor.map(|(kind, id)| json!({"type": kind, "id": id}));
+        let mut targets = vec![
+            json!({"type": "door", "id": "ignored"}),
+            json!({"type": "door", "id": door_id}),
+        ];
+        if let Some(direction) = direction {
+            targets.push(json!({"type": "device_config", "display_name": direction}));
+        }
         serde_json::from_value(json!({
             "@timestamp": timestamp,
             "_source": {
@@ -781,7 +826,7 @@ mod tests {
                     "issuer": plate
                 },
                 "event": {"result": result},
-                "target": [{"type": "door", "id": "ignored"}, {"type": "door", "id": door_id}]
+                "target": targets
             }
         }))
         .unwrap()
@@ -1023,6 +1068,47 @@ mod tests {
             correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
             LprCorrelation::NoMatch
         );
+    }
+
+    #[test]
+    fn exit_side_plate_events_do_not_match() {
+        let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let user = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let hits = vec![lpr_hit_with_direction(
+            "2026-07-19T12:00:10Z",
+            "ABC123",
+            "ACCESS",
+            Some(("user", user)),
+            door,
+            Some("exit"),
+        )];
+        let (since, until) = lpr_window();
+
+        assert_eq!(
+            correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
+            LprCorrelation::NoMatch
+        );
+    }
+
+    #[test]
+    fn missing_direction_fails_closed() {
+        let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let user = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let hits = vec![lpr_hit_with_direction(
+            "2026-07-19T12:00:10Z",
+            "ABC123",
+            "ACCESS",
+            Some(("user", user)),
+            door,
+            None,
+        )];
+        let (since, until) = lpr_window();
+
+        assert!(matches!(
+            correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
+            LprCorrelation::Ambiguous { reason }
+                if reason.contains("omitted its entry/exit direction")
+        ));
     }
 
     #[test]

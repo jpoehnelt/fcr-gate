@@ -1521,7 +1521,10 @@ mod tests {
                     "issuer": plate
                 },
                 "event": {"result": result},
-                "target": [{"type": "door", "id": DOOR_ID}]
+                "target": [
+                    {"type": "door", "id": DOOR_ID},
+                    {"type": "device_config", "display_name": "entry"}
+                ]
             }
         })
     }
