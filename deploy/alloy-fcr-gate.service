@@ -7,7 +7,8 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=root
+User=alloy
+Group=alloy
 WorkingDirectory=/data/fcr-gate/alloy-data
 EnvironmentFile=/data/fcr-gate/secrets/alloy.env
 ExecStart=/data/fcr-gate/bin/alloy run --storage.path=/data/fcr-gate/alloy-data --server.http.listen-addr=127.0.0.1:12345 /data/fcr-gate/deploy/alloy-fcr-gate.config.alloy

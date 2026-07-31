@@ -12,7 +12,22 @@ for variable in FCR_GATE_HOST FCR_GATE_SITE; do
   grep -Eq "^${variable}=[^[:space:]]+$" "$environment_file" || exit 0
 done
 
-install -d -m 0700 "$install_root/alloy-data"
+getent group alloy >/dev/null 2>&1 || groupadd --system alloy
+if ! id -u alloy >/dev/null 2>&1; then
+  useradd --system --gid alloy --home-dir /nonexistent --shell /bin/false alloy
+fi
+journal_group_found=false
+for group in adm systemd-journal; do
+  if getent group "$group" >/dev/null 2>&1; then
+    usermod -a -G "$group" alloy
+    journal_group_found=true
+  fi
+done
+[ "$journal_group_found" = true ] || exit 0
+
+install -d -o alloy -g alloy -m 0750 "$install_root/alloy-data"
+chown root:alloy "$install_root/deploy/alloy-fcr-gate.config.alloy"
+chmod 0640 "$install_root/deploy/alloy-fcr-gate.config.alloy"
 install -m 0644 "$install_root/deploy/alloy-fcr-gate.service" \
   /etc/systemd/system/alloy-fcr-gate.service
 systemctl daemon-reload

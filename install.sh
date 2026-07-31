@@ -75,7 +75,7 @@ done
 [[ "$version" == "latest" || "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] ||
   die "version must be 'latest' or a tag such as v0.1.0"
 
-for command in chmod curl id install mktemp mv sha256sum sort systemctl tar uname; do
+for command in chmod chown curl getent id install mktemp mv sha256sum sort systemctl tar uname; do
   command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
 done
 
@@ -184,6 +184,10 @@ install -m 0755 "$unpack_dir/30-fcr-rfid-encoder.sh" \
   "$ON_BOOT_DIR/30-fcr-rfid-encoder.sh"
 install -m 0644 "$unpack_dir/alloy-fcr-gate.config.alloy" \
   "$INSTALL_ROOT/deploy/alloy-fcr-gate.config.alloy"
+if id -u alloy >/dev/null 2>&1 && getent group alloy >/dev/null 2>&1; then
+  chown root:alloy "$INSTALL_ROOT/deploy/alloy-fcr-gate.config.alloy"
+  chmod 0640 "$INSTALL_ROOT/deploy/alloy-fcr-gate.config.alloy"
+fi
 install -m 0644 "$unpack_dir/alloy-fcr-gate.service" \
   "$INSTALL_ROOT/deploy/alloy-fcr-gate.service"
 install -m 0644 "$unpack_dir/alloy.env.example" \

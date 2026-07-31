@@ -58,7 +58,7 @@ done
 [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]] ||
   die "invalid Alloy version: $version"
 
-for command in awk curl grep id install mktemp mv sha256sum systemctl uname unzip; do
+for command in chmod chown curl getent grep groupadd id install mktemp mv sha256sum systemctl uname unzip useradd usermod; do
   command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
 done
 
@@ -100,6 +100,17 @@ done
 
 asset="alloy-linux-${alloy_arch}.zip"
 release_base="https://github.com/grafana/alloy/releases/download/v${version}"
+case "${version}:${alloy_arch}" in
+  1.18.0:amd64)
+    expected_checksum="92f4c950aec4ec16a7fdbf6f805be4334d4d5fbbe458eecf514319c1c491bef4"
+    ;;
+  1.18.0:arm64)
+    expected_checksum="e20f8570628818a15192d34372839017a4c446269b5d96036ad976ebf7a7728a"
+    ;;
+  *)
+    die "Alloy v${version} for ${alloy_arch} has no checksum pinned in this installer"
+    ;;
+esac
 tmpdir="$(mktemp -d)"
 trap 'rm -rf -- "$tmpdir"' EXIT
 
@@ -109,6 +120,7 @@ curl_args=(
   --location
   --max-time 600
   --proto '=https'
+  --proto-redir '=https'
   --show-error
   --silent
   --tlsv1.2
@@ -117,13 +129,9 @@ curl_args=(
 
 log "downloading Grafana Alloy v${version} for ${alloy_arch}"
 curl "${curl_args[@]}" --output "$tmpdir/$asset" "$release_base/$asset"
-curl "${curl_args[@]}" --output "$tmpdir/SHA256SUMS" "$release_base/SHA256SUMS"
-
-checksum_line="$(awk -v asset="$asset" '$2 == asset { print $1 "  " asset }' "$tmpdir/SHA256SUMS")"
-[[ -n "$checksum_line" ]] || die "Grafana checksum manifest omitted $asset"
 (
   cd "$tmpdir"
-  printf '%s\n' "$checksum_line" | sha256sum --check
+  printf '%s  %s\n' "$expected_checksum" "$asset" | sha256sum --check
 )
 
 unpack_dir="$tmpdir/unpacked"
@@ -137,7 +145,23 @@ chmod 0755 "$alloy_binary"
   die "downloaded Alloy binary did not report v${version}"
 
 install -d -m 0755 "$INSTALL_ROOT/bin" "$ON_BOOT_DIR"
-install -d -m 0700 "$INSTALL_ROOT/alloy-data"
+getent group alloy >/dev/null 2>&1 || groupadd --system alloy
+if ! id -u alloy >/dev/null 2>&1; then
+  useradd --system --gid alloy --home-dir /nonexistent --shell /bin/false alloy
+fi
+journal_group_found=false
+for group in adm systemd-journal; do
+  if getent group "$group" >/dev/null 2>&1; then
+    usermod -a -G "$group" alloy
+    journal_group_found=true
+  fi
+done
+[[ "$journal_group_found" == true ]] ||
+  die "neither adm nor systemd-journal exists; cannot grant Alloy journal access"
+
+install -d -o alloy -g alloy -m 0750 "$INSTALL_ROOT/alloy-data"
+chown root:alloy "$INSTALL_ROOT/deploy/alloy-fcr-gate.config.alloy"
+chmod 0640 "$INSTALL_ROOT/deploy/alloy-fcr-gate.config.alloy"
 install -m 0755 "$alloy_binary" "$INSTALL_ROOT/bin/alloy.new"
 mv -f "$INSTALL_ROOT/bin/alloy.new" "$INSTALL_ROOT/bin/alloy"
 install -m 0755 "$INSTALL_ROOT/deploy/40-alloy-fcr-gate.sh" \

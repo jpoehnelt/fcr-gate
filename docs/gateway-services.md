@@ -309,10 +309,12 @@ less /tmp/install-fcr-gate-alloy.sh
 bash /tmp/install-fcr-gate-alloy.sh
 ```
 
-The installer downloads the pinned official Grafana Alloy standalone binary,
-verifies it against Grafana's release checksum manifest, stores it under
-`/data/fcr-gate`, and installs a UniFi boot hook. The dedicated service runs with a
-read-only system view except for its persistent WAL directory. Verify delivery:
+The installer downloads the pinned official Grafana Alloy standalone binary and
+verifies it against an independently pinned digest in the attested FCR Gate
+installer. It creates an unprivileged `alloy` service account, grants only the
+platform's journal-read groups, stores the binary under `/data/fcr-gate`, and
+installs a UniFi boot hook. The service has a read-only system view except for its
+persistent WAL directory. Verify delivery:
 
 ```bash
 systemctl status alloy-fcr-gate --no-pager
@@ -360,8 +362,10 @@ Expected layout on a UniFi OS 4.x/5.x Cloud Gateway:
 │   ├── fcr-gate-admin
 │   └── fcr-rfid-encoder
 ├── deploy/
+│   ├── 40-alloy-fcr-gate.sh
 │   ├── alloy-fcr-gate.config.alloy
 │   ├── alloy-fcr-gate.service
+│   ├── alloy.env.example
 │   ├── cloudflared.service
 │   └── fcr-rfid-encoder.service
 ├── alloy-data/
