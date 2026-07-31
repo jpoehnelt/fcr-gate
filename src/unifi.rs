@@ -562,18 +562,27 @@ fn correlate_lpr_hits(
                 reason: "an Entry Gate plate event omitted its entry/exit direction".into(),
             });
         }
-        if !direction_targets
+        if direction_targets
             .iter()
-            .any(|target| target.display_name.trim().eq_ignore_ascii_case("entry"))
+            .any(|target| target.display_name.trim().is_empty())
         {
-            continue;
+            return Ok(LprCorrelation::Ambiguous {
+                reason: "an Entry Gate plate event omitted its entry/exit direction".into(),
+            });
         }
         if direction_targets
             .iter()
-            .any(|target| !target.display_name.trim().eq_ignore_ascii_case("entry"))
+            .all(|target| target.display_name.trim().eq_ignore_ascii_case("exit"))
+        {
+            continue;
+        }
+        if !direction_targets
+            .iter()
+            .all(|target| target.display_name.trim().eq_ignore_ascii_case("entry"))
         {
             return Ok(LprCorrelation::Ambiguous {
-                reason: "an Entry Gate plate event reported conflicting directions".into(),
+                reason: "an Entry Gate plate event reported conflicting or unknown directions"
+                    .into(),
             });
         }
         let plate = authentication.issuer.clone();
@@ -809,13 +818,35 @@ mod tests {
         door_id: &str,
         direction: Option<&str>,
     ) -> SystemLogHit {
+        lpr_hit_with_direction_field(
+            timestamp,
+            plate,
+            result,
+            actor,
+            door_id,
+            direction.map(Some),
+        )
+    }
+
+    fn lpr_hit_with_direction_field(
+        timestamp: &str,
+        plate: &str,
+        result: &str,
+        actor: Option<(&str, &str)>,
+        door_id: &str,
+        direction: Option<Option<&str>>,
+    ) -> SystemLogHit {
         let actor = actor.map(|(kind, id)| json!({"type": kind, "id": id}));
         let mut targets = vec![
             json!({"type": "door", "id": "ignored"}),
             json!({"type": "door", "id": door_id}),
         ];
         if let Some(direction) = direction {
-            targets.push(json!({"type": "device_config", "display_name": direction}));
+            let mut target = json!({"type": "device_config"});
+            if let Some(direction) = direction {
+                target["display_name"] = json!(direction);
+            }
+            targets.push(target);
         }
         serde_json::from_value(json!({
             "@timestamp": timestamp,
@@ -1101,6 +1132,48 @@ mod tests {
             Some(("user", user)),
             door,
             None,
+        )];
+        let (since, until) = lpr_window();
+
+        assert!(matches!(
+            correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
+            LprCorrelation::Ambiguous { reason }
+                if reason.contains("omitted its entry/exit direction")
+        ));
+    }
+
+    #[test]
+    fn blank_direction_fails_closed() {
+        let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let user = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let hits = vec![lpr_hit_with_direction(
+            "2026-07-19T12:00:10Z",
+            "ABC123",
+            "ACCESS",
+            Some(("user", user)),
+            door,
+            Some(""),
+        )];
+        let (since, until) = lpr_window();
+
+        assert!(matches!(
+            correlate_lpr_hits(&hits, door, since, until, false).unwrap(),
+            LprCorrelation::Ambiguous { reason }
+                if reason.contains("omitted its entry/exit direction")
+        ));
+    }
+
+    #[test]
+    fn direction_target_without_display_name_fails_closed() {
+        let door = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
+        let user = "17d2f099-99df-429b-becb-1399a6937e5a";
+        let hits = vec![lpr_hit_with_direction_field(
+            "2026-07-19T12:00:10Z",
+            "ABC123",
+            "ACCESS",
+            Some(("user", user)),
+            door,
+            Some(None),
         )];
         let (since, until) = lpr_window();
 
