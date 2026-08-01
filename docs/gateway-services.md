@@ -1,406 +1,129 @@
 # Gateway services
 
-This repository owns two gateway services:
+The gateway runs two independent services:
 
-1. `cloudflared`, exposing only the loopback web service through Cloudflare Tunnel.
-2. `fcr-rfid-encoder`, an Impinj R700 inventory/exact-TID EPC writer, authenticated
-   tag-assignment UI, and optional UniFi-authorized gate trigger.
+1. `cloudflared`, which exposes selected loopback endpoints.
+2. `fcr-rfid-encoder`, which inventories an Impinj R700, learns vehicle tags,
+   checks UniFi Access authorization, and can trigger the Entry Gate.
 
-For the release installer and basic commands, start with the
-[project README](../README.md#rfid-gateway-service). This document covers the
-runtime architecture and commissioning details.
+The RFID binary keeps its historical name for release and deployment
+compatibility. It does not write EPCs or modify tags.
+
+## Data flow
 
 ```mermaid
 flowchart LR
-    U["Authorized operator"] --> A["Cloudflare Access"]
-    A --> T["cloudflared"]
-    T -->|"127.0.0.1 only"| W["FCR Gate web service"]
-    W -->|"claim / revoke"| E["Rust RFID service + SQLite"]
-    E <-->|"IoT Device Interface"| R["Impinj R700"]
-    E -->|"current user + policy + schedule"| UA["UniFi Access API"]
-    UA -->|"attributed remote unlock"| G["Entry Gate"]
-    E -->|"complete local JSON log"| J["journald"]
-    E -.->|"best-effort JSON batches"| L["Loki over Tailscale"]
+    R["Impinj R700"] -->|"inventory events with FastID TID"| S["Rust RFID service"]
+    S <-->|"plate events, users, policies, schedules; authorized unlock request"| U["UniFi Access API"]
+    U -->|"unlock command"| G["Entry Gate"]
+    S --> D["SQLite evidence and ownership"]
+    S --> J["journald JSON"]
+    S -.->|"best-effort JSON batches"| L["Loki over Tailscale"]
+    H["Prometheus"] -->|"GET /metrics"| S
 ```
 
 ## Safety boundary
 
-- The web service must bind to loopback, not the LAN or WAN interface.
-- Cloudflare Access must protect the hostname before the operator UI is enabled.
-- Every operator route requires Cloudflare's authenticated-user email header;
-  Cloudflare Access policy determines which identities are allowed.
-- RFID writes default to disabled and require an explicit server-side setting.
-- UniFi gate unlocks use a separate setting and also default to disabled.
-- `/healthz` and `/metrics` contain no tag or user data, bind to loopback with the
-  UI, and should use a Cloudflare Access service token for external monitoring.
-- Every write must record the operator, requested EPC, result, and timestamp without
-  logging reader passwords, tunnel tokens, or other credentials.
-- Reader and Cloudflare credentials live below `/data/fcr-gate/secrets/` with mode
+- Discovery and gate authorization default to `disabled`.
+- Use `dry-run` before either feature is set to `live`.
+- Gate authorization checks the current UniFi user, Entry Gate policy, door group,
+  weekly schedule, and holidays before sending an unlock request.
+- Only entry-side license-plate events participate in discovery. Exit-side and
+  directionless events fail closed.
+- Reader and UniFi credentials live below `/data/fcr-gate/secrets/` with mode
   `0600`; they are never command-line arguments or repository content.
-- Reported EPC exports are operational data and remain ignored by Git.
+- `/healthz` and `/metrics` contain no tag, user, vehicle, or credential values.
+- The service never writes, locks, kills, or otherwise changes RFID tags.
 
-## Reader credentials
+## Reader setup
 
-Impinj documents `root` / `impinj` as the legacy factory login for R700 and
-Speedway readers. R700 firmware 9.0 and newer requires the password to be changed
-on first login. If the factory login still works, change it before connecting any
-service. Do not put either the old or new password in this repository.
+Use the R700 IoT Device Interface, set its regulatory region, enable FastID/TID
+reporting, and select the antenna and RF settings in `gateway.env`. The service
+installs an inventory preset and streams newline-delimited events from
+`/api/v1/data/stream`. Tags without a TID are retained as EPC-only evidence, but
+TID is preferred because it remains stable even when several tags share an EPC.
 
-- Troubleshooting and login guidance:
-  <https://support.impinj.com/article/177630167898291497>
-- R700 firmware 9.x first-login behavior:
-  <https://support.impinj.com/hc/article_attachments/22893542233107>
+The event connection is recycled after 90 seconds without reader data. On clean
+shutdown the service stops its preset.
 
-## R700 encoder
+## Multi-visit discovery
 
-The Rust service uses the R700 IoT Device Interface rather than LLRP. At startup it
-checks `/api/v1/status`, verifies tag-access support from `/api/v1/openapi.json`,
-and installs a persistent inventory preset. It streams newline-delimited events
-from `/api/v1/data/stream` and submits one transient access operation at
-`/api/v1/profiles/inventory/tag-access`.
+`RFID_DISCOVERY_MODE=dry-run` or `live` learns the relationship between a tag and
+a vehicle over repeated entries. Each continuous period of RFID visibility is one
+passage, so repeated inventory reads do not add votes. A passage is matched only
+when its time window contains one successful entry-side plate identity.
 
-An encode transaction has all of these gates:
+UniFi can publish an LPR event after the tag leaves the field. Pending passages are
+retried with their original timestamps, including after a restart, so delayed logs
+cannot match unrelated current traffic. Common `O`/`0` and `I`/`1` OCR variants
+are grouped for evidence while original plate readings remain in SQLite for audit.
+Competing plates, blocked reads, long stationary reads, and ambiguous windows count
+against confidence.
 
-1. The tag is on the configured antenna, has the known default EPC, reports a TID
-   through FastID, and exceeds the RSSI threshold.
-2. The same TID is read repeatedly during a short window, with no second default-EPC
-   TID present. Only one transaction may be in flight.
-3. A SQLite transaction durably assigns the TID a site prefix plus 32-bit sequence.
-4. The R700 selector matches the complete TID. Six one-word commands write EPC bank
-   words 2 through 7, followed by a six-word read-back command.
-5. Every command must report success and the read-back must equal the assigned EPC.
-6. A subsequent normal inventory event must pair the same TID with the new EPC.
-
-The database uses WAL mode and `synchronous=FULL`. Interrupted queued operations
-return to `pending` on restart and reuse their existing EPC; they never allocate a
-replacement. Failed writes use a cooldown and maximum-attempt limit. An unexpected
-non-default EPC for an assigned TID becomes a conflict requiring an explicit retry.
-The audit table records allocations, attempts, verification, completion, failures,
-and the configured actor without storing reader credentials.
-
-Retrying a conflict explicitly authorizes repair of that exact TID back to its
-existing durable assignment. The normal default-EPC and ambiguity gates still
-apply to ordinary first-time encodes.
-
-The event connection is recycled after 90 seconds without reader data, and an
-in-flight transaction is released after its configured timeout. SIGINT/SIGTERM
-shutdown stops the service-owned preset, which also makes the R700 discard any
-still-pending transient access request.
-
-Writes are disabled by default. Commission them in this order:
-
-1. Set the R700 to the IoT Device Interface and configure its regulatory region.
-2. Isolate one loose tag in the antenna field. A far-field gate antenna can see a
-   nearby spool or vehicle tag, so physical separation and reduced transmit power
-   are part of the safety system.
-3. Configure the reader password file, antenna port, conservative power/RSSI values,
-   and leave `RFID_WRITES_ENABLED=false`. Run until logs consistently report one
-   dry-run candidate.
-4. Choose and record a site-unique 64-bit `RFID_EPC_PREFIX`. This implementation
-   writes only the 96-bit EPC; it does not change access, kill, or lock state.
-5. Enable writes for a single test tag. Verify the service reports both read-back
-   and ordinary-inventory confirmation before using it at the gate.
-
-Tags that do not provide a usable FastID TID are ignored intentionally; the service
-will not fall back to selecting the shared default EPC. Inspect state or authorize a
-controlled retry with:
+Candidates need the configured number of occurrences, distinct days, confidence,
+and conflict limits. Permanent-user evidence can activate an association in live
+mode after UniFi validation. Visitor-backed evidence remains `needs-resident`
+until an administrator associates it with a permanent UniFi user:
 
 ```bash
-RFID_STATE_DB=/data/fcr-gate/rfid-encoder.sqlite3 \
-  /data/fcr-gate/bin/fcr-rfid-encoder status
-RFID_STATE_DB=/data/fcr-gate/rfid-encoder.sqlite3 \
-  /data/fcr-gate/bin/fcr-rfid-encoder retry <TID>
-```
-
-## Ownership and gate authorization
-
-Encoding and ownership are deliberately separate. A newly encoded tag is
-`unassigned`, even if it is immediately readable at the gate. The operator UI
-allows a claim only while that exact TID has been seen recently. It searches active
-UniFi users, verifies that the selected user has an Entry Gate policy, and stores
-the mapping locally. It never writes comma-separated EPCs into `employee_number`
-and never treats an EPC as a native UniFi NFC credential.
-
-Ownership states are `unassigned`, `active`, `revoked`, and `lost` (the latter is
-reserved in the database for operational loss handling). Transfers require an
-explicit revoke followed by a new claim. Claims and revocations record the
-Cloudflare-authenticated operator email in `audit_log`.
-
-`RFID_LPR_CORRELATION_MODE=dry-run` or `live` can correlate a newly encoded tag
-with an existing permanent UniFi user automatically. The service considers only
-one completed tag that has never been assigned, then reads a short window of
-Entry Gate `LICENSEPLATE` logs. A match requires the configured Entry Gate door,
-UniFi's `device_config` target set to `entry`, exactly one plate, and one distinct
-successful `ACCESS` user/plate pair whose actor type is `user`, plus an active user
-and an Entry Gate access policy. Exit-side events are ignored; an event with no
-direction marker fails closed as ambiguous. Repeated reads of the same pair are
-harmless.
-Visitor events do not directly assign a newly encoded tag to a permanent user.
-They remain available to multi-visit discovery instead. Blocked-only reads,
-another plate, another unassigned tag, truncated logs, or malformed data do not
-create an assignment.
-
-Ambiguity advances a per-TID cutoff in SQLite, so an old event cannot become a
-match merely because other activity ages out of the window or the service
-restarts. The tag remains unassigned and eligible indefinitely; if it returns days
-later, a new clean plate event inside `RFID_LPR_CORRELATION_WINDOW_MS` can create
-the relationship. Revoked or lost tags are never reassigned automatically.
-Dry-run audits the candidate and advances the cutoff without changing ownership;
-live mode stores the TID-to-user relationship locally with the matched plate as
-the vehicle description. The LPR event has already opened the gate, so live
-correlation suppresses a redundant RFID unlock on that pass.
-
-### Multi-visit discovery for existing vehicle tags
-
-`RFID_DISCOVERY_MODE=dry-run` or `live` learns existing non-default tags such as a
-readable toll pass without rewriting them. TID is the durable identity when the
-tag reports it; otherwise the service uses `EPC:<hex>` as a lower-confidence
-fallback. The configured factory-default EPC is always excluded. EPC-only
-candidates require at least five matches even when
-`RFID_DISCOVERY_MIN_OCCURRENCES` is lower.
-
-Each period of continuous RFID visibility is one passage. Repeated inventory reads
-and repeated queries of the same UniFi LPR event cannot add votes. A passage is
-credited only when its short matching window contains one distinct successful
-plate identity. UniFi may identify that actor as either a permanent `user` or a
-temporary `visitor`; the actor type and ID are retained with the plate so they
-cannot be conflated. Unmatched and ambiguous passages remain evidence against
-confidence rather than disappearing. Blocked plate reads never count as a match.
-For evidence grouping, case differences and the common `O`/`0` and `I`/`1` OCR
-substitutions are treated as one plate family when the UniFi actor also matches.
-The original plate reported on every passage remains unchanged in SQLite for
-audit. Other one-character differences remain distinct and can become conflicts.
-The matching window is anchored to the R700 event timestamp, so delayed buffered
-reads cannot match a current vehicle.
-
-UniFi Access can publish a successful LPR event to the system-log API after the
-RFID tag has left the reader field. Pending passages are therefore retried up to
-three times, beginning 15 seconds after the last tag report and then every 15
-seconds. On restart, the service also retries pending passages from the previous
-90 seconds. Every retry uses the original RFID timestamp and matching window, so
-a later vehicle cannot satisfy an older passage.
-
-The defaults activate a TID candidate after at least three matching passages on
-two distinct UTC days, at least 80 percent of all retained non-stationary passages
-matching the leading user/plate pair, and fewer than two matches for any competing
-pair. Multiple tags in one vehicle can independently learn the same plate. A tag
-that remains continuously visible beyond `RFID_DISCOVERY_MAX_DWELL_MS` is treated
-as stationary and cannot qualify.
-
-User-backed candidates can activate automatically in live mode after the current
-UniFi user and Entry Gate policy are validated. Visitor-backed candidates stop at
-`needs-resident`: the visitor proves a durable tag-to-plate relationship but is not
-treated as the permanent gate owner. An administrator must explicitly associate a
-mature candidate with an active permanent user who has Entry Gate access. The
-command is dry-run by default and requires `--apply` to write the local association.
-
-Live learned assignments are renewable 60-day leases. A later successful LPR
-passage for the same source actor and plate renews the lease; repeated evidence for
-another vehicle or a long-dwell tag suspends it. Dry-run records observations and
-candidate audits but never activates, renews, or suspends an assignment. Existing
-learned tags still undergo the normal live UniFi status, policy, and schedule
-checks before an RFID-only unlock.
-
-Review candidates and revoke a learned assignment from the gateway with:
-
-```bash
-set -a
-. /data/fcr-gate/secrets/gateway.env
-set +a
 /data/fcr-gate/bin/fcr-rfid-encoder discovery-status --limit 100
 /data/fcr-gate/bin/fcr-rfid-encoder associate-discovered \
   TID_OR_EPC_KEY UNIFI_USER_ID --dry-run
-# After reviewing the validated plan:
 /data/fcr-gate/bin/fcr-rfid-encoder associate-discovered \
   TID_OR_EPC_KEY UNIFI_USER_ID --apply
-/data/fcr-gate/bin/fcr-rfid-encoder revoke-learned TID_OR_EPC_KEY
-/data/fcr-gate/bin/fcr-rfid-encoder reset-learned SUSPENDED_TID_OR_EPC_KEY
 ```
 
-Some toll systems use protocols the R700 cannot inventory; those passes will not
-appear as candidates. Raw passage evidence is retained only for
-`RFID_DISCOVERY_EVIDENCE_DAYS`.
+## Gate authorization
 
-With `RFID_GATE_MODE=dry-run` or `live`, a read from an active assignment is not
-itself authorization. The service asks UniFi for the user's current status and all
-direct and group access policies, expands door groups, and evaluates the Entry Gate
-policy's weekly and holiday schedules. Any missing resource, malformed response,
-inactive user, out-of-schedule policy, or API failure leaves the gate locked.
-
-Dry-run records the same granted, denied, and error decisions in `gate_events` with
-`mode='dry-run'`, but never calls the unlock endpoint. Live mode invokes UniFi's
-remote door unlock with the user ID/name as the actor and the TID/EPC/policy in
-passthrough metadata. Repeated reads are rate-limited per TID in both modes.
+Set `RFID_GATE_MODE=dry-run` to evaluate and record the full authorization path
+without opening the gate. Review decisions with:
 
 ```bash
-RFID_STATE_DB=/data/fcr-gate/rfid-encoder.sqlite3 \
-  /data/fcr-gate/bin/fcr-rfid-encoder gate-events --limit 50
+/data/fcr-gate/bin/fcr-rfid-encoder gate-events --limit 50
 ```
 
-Required Access API token permissions are `view:user`, `view:policy`, `view:space`,
-and `edit:space`. Store the token in
-`/data/fcr-gate/secrets/unifi-access-api-key` with mode `0600`. Schedule evaluation
-uses the service's local timezone, so set `TZ=America/Denver` on this gateway.
+Only set the mode to `live` after the learned associations and dry-run decisions
+look correct. An unlock cooldown prevents repeated reader reports from issuing
+duplicate requests.
 
-Expose the UI through the existing named tunnel, for example:
+## Health, metrics, and logs
 
-```yaml
-ingress:
-  - hostname: rfid.fallscreekranch.org
-    service: http://127.0.0.1:8080
-  - service: http_status:404
-```
-
-Before setting `FCR_GATE_WEB_ENABLED=true`, create a Cloudflare Access application
-for that hostname and restrict its policy to the intended operators. Keep
-`RFID_LPR_CORRELATION_MODE=disabled`, `RFID_DISCOVERY_MODE=disabled`, and
-`RFID_GATE_MODE=disabled` while testing manual claims and revocations. Test each
-feature in `dry-run` and review its logs and audit records before changing that
-feature to `live`.
-
-## Health monitoring
-
-`FCR_GATE_HEALTH_ENABLED=true` exposes `GET /healthz` on the loopback HTTP port,
-independently of the operator UI. The reader stream updates an in-memory connection
-and activity marker when its HTTPS stream connects or receives bytes. A brief
-reconnect remains healthy using the most recent activity time; activity older than
-`FCR_GATE_HEALTH_STALE_MS` is unhealthy. The check also opens the SQLite database
-and reads the durable allocator row.
-
-- `200`: reader activity is recent and SQLite is readable.
-- `503`: reader activity is stale/missing or SQLite cannot be read.
-
-The response deliberately excludes TID, EPC, user, vehicle, policy, and error text.
-The same listener exposes Prometheus-format direct-Loki delivery counters at
-`GET /metrics`. Use a path-specific Cloudflare Access service-token policy for
-external monitoring, or query the loopback endpoints locally.
-
-## Loki event inspection
-
-The encoder writes newline-delimited JSON to stderr, which systemd stores in the
-journal. Operational events use stable names such as `service_ready`,
-`reader_stream_disconnected`, `rfid_passage_started`, `lpr_correlation_match`, and
-`gate_authorization`. One `rfid_passage_started` record is emitted per passage,
-rather than one record per reader report. TIDs, EPCs, plates, user IDs, errors, and
-RSSI values remain JSON fields so they can be searched without creating
-high-cardinality Loki labels. Keep `RUST_LOG=info` in `gateway.env` to retain
-passage and successful-decision events; `warn` suppresses them.
-
-Direct Loki delivery is optional and runs inside the Rust service. The formatter
-writes each complete JSON record to stderr first, so systemd retains it in
-journald, then uses a nonblocking send to copy the same record into a bounded
-in-memory queue. A background task sends batches of up to 100 records at least
-once per second with a five-second request timeout and capped exponential retry.
-A full queue drops only the remote copy; RFID reads, UniFi decisions, and the
-local journal continue normally. There is intentionally no disk-backed Loki
-queue because journald is the durable local fallback.
-
-Configure the existing root-only `gateway.env` file. Leave
-`FCR_GATE_LOKI_URL` empty to disable remote delivery:
-
-```dotenv
-FCR_GATE_LOKI_URL=http://loki.tail1f002.ts.net:3100/loki/api/v1/push
-FCR_GATE_HOST=falls-creek-ranch-gate
-FCR_GATE_SITE=falls-creek-ranch
-```
-
-The URL must use HTTP or HTTPS, contain no embedded credentials, query, or
-fragment, and end with `/loki/api/v1/push`. The current homelab endpoint uses no
-authentication and is reachable only through the tailnet. An invalid Loki setting
-disables remote delivery and records `loki_config_invalid` in journald instead of
-preventing the gate service from starting. Restart the existing service after
-changing the environment file:
+The loopback server exposes:
 
 ```bash
-systemctl restart fcr-rfid-encoder
-journalctl -u fcr-rfid-encoder -n 100 --no-pager
+curl --fail-with-body http://127.0.0.1:8080/healthz
 curl --fail http://127.0.0.1:8080/metrics
 ```
 
-`loki_delivery_failed` and `loki_delivery_recovered` records are written directly
-to journald to avoid feeding exporter failures back into the Loki queue. The
-Prometheus endpoint reports queue depth, enqueued, sent, and dropped events,
-request results, and the last successful push time.
+The service writes complete newline-delimited JSON to journald. When
+`FCR_GATE_LOKI_URL` is set, it also sends bounded, nonblocking batches directly to
+Loki. Delivery failure never blocks inventory or removes the local journal copy.
 
-Useful LogQL queries:
+Useful commands:
 
-```logql
-{service_name="fcr-gate"} | json | tid="E2801234"
+```bash
+systemctl status fcr-rfid-encoder --no-pager
+journalctl -u fcr-rfid-encoder -n 100 --no-pager
+systemctl restart fcr-rfid-encoder
 ```
 
-```logql
-{service_name="fcr-gate"} | json | event="lpr_correlation_match"
-```
-
-```logql
-{service_name="fcr-gate"} | json | decision=~"denied|error"
-```
-
-SQLite remains the durable source of truth for assignments, evidence, and audit
-records. Journald is the complete local service log, Loki is the searchable remote
-timeline, and Prometheus remains the right place for health, rates, and alerts.
-
-Impinj references:
-
-- IoT Device Interface API: <https://support.impinj.com/article/32195454977555>
-- R700 firmware release notes: <https://support.impinj.com/article/32123172324755>
-- Reader configuration and REST examples: <https://support.impinj.com/article/202756008>
-
-## Durable Cloudflare service
-
-The checked-in [`deploy/cloudflared.service`](../deploy/cloudflared.service) reads
-the tunnel token from a root-only file and runs the binary from persistent `/data`.
-The boot script recreates the systemd unit after startup.
-
-Expected layout on a UniFi OS 4.x/5.x Cloud Gateway:
+## Persistent gateway layout
 
 ```text
 /data/fcr-gate/
-├── bin/
-│   ├── cloudflared
-│   ├── fcr-gate-admin
-│   └── fcr-rfid-encoder
-├── deploy/
-│   ├── cloudflared.service
-│   └── fcr-rfid-encoder.service
+├── bin/fcr-rfid-encoder
+├── deploy/fcr-rfid-encoder.service
 ├── rfid-encoder.sqlite3
 └── secrets/
-    ├── cloudflare-tunnel-token
+    ├── gateway.env
     ├── impinj-password
-    ├── unifi-access-api-key
-    └── gateway.env
+    └── unifi-access-api-key
 ```
 
-Install the current community UniFi boot hook, then place or link
-`deploy/20-cloudflared.sh` at `/data/on_boot.d/20-cloudflared.sh`. Run the script
-once to install and start the unit. This is a community-supported appliance
-customization, so verify it after every UniFi OS upgrade.
+The release installer preserves configuration, secrets, and SQLite state across
+upgrades. `deploy/30-fcr-rfid-encoder.sh` restores the systemd unit after UniFi OS
+updates.
 
-Install `deploy/30-fcr-rfid-encoder.sh` through the same boot-hook mechanism after
-cross-compiling/copying the encoder binary for the gateway architecture. Start
-with the example environment and keep the password and environment files mode
-`0600`. The script enables the unit; it does not alter the checked-in safety
-default that keeps writes off.
-
-Tagged GitHub releases automate installation and updates for the FCR Gate binaries
-and encoder service, including direct Loki delivery when its URL is configured.
-Releases do not install or update `cloudflared`. See
-[Install on the UniFi gateway](../README.md#install-on-the-unifi-gateway) for the
-verified release workflow.
-
-Cloudflare references:
-
-- Tunnel setup: <https://developers.cloudflare.com/tunnel/setup/>
-- Linux service: <https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/as-a-service/linux/>
-- Token files: <https://developers.cloudflare.com/tunnel/advanced/run-parameters/#token-file>
-
-## EPC report ingestion
-
-Keep the actual export outside Git and inspect it locally:
-
-```bash
-/data/fcr-gate/bin/fcr-gate-admin epc-report reported_EPCs.csv --list
-```
-
-Use the original CSV export as input. Text copied through chat or email may lose
-the delimiters required by the parser.
+The first release without EPC writing removes obsolete writer tables from the
+SQLite database. Any ownership that existed only in the old writer tables must be
+learned again through multi-visit discovery.

@@ -2,15 +2,15 @@
 
 Rust tools and gateway services for the FCR Gate UniFi Access controller. The
 project extracts license-plate reads, manages temporary recurring visitors,
-encodes RFID tags through an Impinj R700, and can authorize the Entry Gate from a
-tag owner's current UniFi policy and schedule.
+learns vehicle RFID tags through an Impinj R700, and can authorize the Entry Gate
+from a tag owner's current UniFi policy and schedule.
 
 ## Components
 
 | Component | Purpose | Safety default |
 | --- | --- | --- |
 | `fcr-gate-admin` | License-plate administration and offline EPC reports | Mutating commands require `--apply` |
-| `fcr-rfid-encoder` | R700 encoding, tag ownership, health, and gate authorization | RFID writes and gate unlocks disabled |
+| `fcr-rfid-encoder` | R700 TID discovery, tag ownership, health, and gate authorization | Discovery and gate unlocks disabled |
 | `deploy/` | Persistent systemd units and UniFi boot hooks | Local-only services and root-owned secrets |
 
 ## Build and configure
@@ -31,7 +31,7 @@ UNIFI_API_KEY=<token>
 
 Process environment variables override `.env`. `UNIFI_API_KEY_FILE` is preferred
 for long-running services. Never commit `.env`, secret files, exported plate data,
-or the encoder's SQLite database.
+or the RFID service's SQLite database.
 
 ## UniFi Access administration
 
@@ -86,28 +86,24 @@ This operation is offline and never changes the reader.
 
 ## RFID gateway service
 
-`fcr-rfid-encoder` inventories the configured R700 antenna and recognizes the
-factory EPC `300833B2DDD9014000000000`. It requires repeated, strong reads of one
-exact TID before allocating and writing a durable 96-bit EPC. Every write is read
-back and then confirmed through ordinary inventory. An independent multi-visit
-discovery mode can also learn an existing, non-default vehicle tag from repeated
-successful LPR passages without rewriting the tag.
+`fcr-rfid-encoder` inventories the configured R700 antenna and uses FastID TIDs as
+durable tag identities. Multi-visit discovery learns a vehicle tag from repeated
+successful LPR passages. It never writes or changes a tag's EPC.
 
 Start in observation-only mode:
 
 ```bash
 cp deploy/gateway.env.example /data/fcr-gate/secrets/gateway.env
-# Configure the reader, but leave RFID_WRITES_ENABLED=false.
+# Configure the reader and leave discovery and gate authorization disabled.
 set -a
 . /data/fcr-gate/secrets/gateway.env
 set +a
 target/release/fcr-rfid-encoder run
 ```
 
-RFID writes, automatic LPR ownership correlation, the operator UI, and gate
-unlocks have independent safety controls. See
-[Gateway services](docs/gateway-services.md) for commissioning, tag ownership,
-Cloudflare Access, health monitoring, and failure handling.
+Discovery and gate unlocks have independent safety controls. See
+[Gateway services](docs/gateway-services.md) for commissioning, learned tag
+ownership, health monitoring, and failure handling.
 
 ### Install on the UniFi gateway
 
@@ -161,8 +157,6 @@ FCR Gate binaries and service. See [Durable Cloudflare service](docs/gateway-ser
 ### Operate and monitor
 
 ```bash
-RFID_STATE_DB=/data/fcr-gate/rfid-encoder.sqlite3 \
-  /data/fcr-gate/bin/fcr-rfid-encoder status
 RFID_STATE_DB=/data/fcr-gate/rfid-encoder.sqlite3 \
   /data/fcr-gate/bin/fcr-rfid-encoder gate-events --limit 50
 RFID_STATE_DB=/data/fcr-gate/rfid-encoder.sqlite3 \

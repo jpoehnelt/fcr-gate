@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     time::{Duration, Instant},
 };
 
@@ -7,15 +7,13 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use fcr_rfid_encoder::{
-    config::{Config, GateMode, LprCorrelationMode, normalize_hex, state_db_path},
-    engine::{Action, Engine},
+    config::{Config, DiscoveryMode, GateMode, normalize_hex, state_db_path},
     impinj::ImpinjClient,
     logging,
-    model::{DiscoveryObservation, ReaderEvent, TagObservation},
+    model::{DiscoveryObservation, ReaderEvent},
     plate::same_plate_family,
     store::{
         DiscoveryCandidate, DiscoverySeen, PassageMatchOutcome, PendingDiscoveryPassage, Store,
-        now_ms,
     },
     unifi::{AuthorizationDecision, LprCorrelation, UnifiClient},
     web,
@@ -32,20 +30,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the R700 inventory and encode-on-first-arrival loop.
+    /// Run the R700 inventory, tag discovery, and gate-authorization loop.
     Run,
-    /// Show durable EPC assignments and their current state.
-    Status {
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-    },
     /// Show recent live and dry-run gate authorization decisions.
     GateEvents {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Reset a failed or conflicted TID for another controlled attempt.
-    Retry { tid: String },
     /// Show multi-visit EPC/TID-to-vehicle discovery candidates.
     DiscoveryStatus {
         #[arg(long, default_value_t = 100)]
@@ -71,7 +62,6 @@ enum Command {
 struct GateRuntime {
     unifi: Option<UnifiClient>,
     last_attempts: HashMap<String, Instant>,
-    lpr_last_attempts: HashMap<String, Instant>,
     discovery_last_attempts: HashMap<String, Instant>,
     discovery_retry_attempts: HashMap<i64, DiscoveryRetryState>,
     discovery_lpr_cache: Option<CachedDiscoveryLpr>,
@@ -102,9 +92,7 @@ async fn main() -> Result<()> {
 
     let result = match Cli::parse().command.unwrap_or(Command::Run) {
         Command::Run => run(loki_metrics).await,
-        Command::Status { limit } => status(limit),
         Command::GateEvents { limit } => gate_events(limit),
-        Command::Retry { tid } => retry(&tid),
         Command::DiscoveryStatus { limit } => discovery_status(limit),
         Command::AssociateDiscovered {
             tag_key,
@@ -122,51 +110,24 @@ async fn main() -> Result<()> {
 async fn run(loki_metrics: std::sync::Arc<logging::LokiMetrics>) -> Result<()> {
     let config = Config::from_env()?;
     let mut store = Store::open(&config.state_db, config.actor.clone())?;
-    let recovered = store.recover_interrupted()?;
-    if recovered > 0 {
-        warn!(
-            event = "encoding_assignments_recovered",
-            recovered, "recovered interrupted encoding assignments"
-        );
-    }
 
     let reader = ImpinjClient::new(&config)?;
     reader.ensure_profile(&config).await?;
     let reader_health = reader.health();
-    let unifi = (config.web_enabled
-        || config.gate_mode.enabled()
-        || config.lpr_correlation_mode.enabled()
-        || config.discovery_mode.enabled())
-    .then(|| UnifiClient::new(&config))
-    .transpose()?;
+    let unifi = (config.gate_mode.enabled() || config.discovery_mode.enabled())
+        .then(|| UnifiClient::new(&config))
+        .transpose()?;
 
-    let (sender, mut receiver) = mpsc::channel::<ReaderEvent>(4096);
-    let stream_task = tokio::spawn(reader.clone().stream_events(sender));
-    let web_handle = if config.web_enabled || config.health_enabled {
-        Some(
-            web::start(
-                &config,
-                unifi.clone(),
-                reader_health,
-                std::sync::Arc::clone(&loki_metrics),
-            )
-            .await?,
-        )
+    let web_handle = if config.health_enabled {
+        Some(web::start(&config, reader_health, std::sync::Arc::clone(&loki_metrics)).await?)
     } else {
         None
     };
-    let mut engine = Engine::new(
-        config.antenna_port,
-        config.default_epc.clone(),
-        config.min_rssi_cdbm,
-        config.confirm_reads,
-        config.confirm_window,
-    );
-    let mut dry_run_reported = HashSet::new();
+    let (sender, mut receiver) = mpsc::channel::<ReaderEvent>(4096);
+    let stream_task = tokio::spawn(reader.clone().stream_events(sender));
     let mut gate = GateRuntime {
         unifi,
         last_attempts: HashMap::new(),
-        lpr_last_attempts: HashMap::new(),
         discovery_last_attempts: HashMap::new(),
         discovery_retry_attempts: HashMap::new(),
         discovery_lpr_cache: None,
@@ -178,24 +139,13 @@ async fn run(loki_metrics: std::sync::Arc<logging::LokiMetrics>) -> Result<()> {
 
     info!(
         event = "service_ready",
-        writes_enabled = config.writes_enabled,
         antenna = config.antenna_port,
-        min_rssi_dbm = config.min_rssi_cdbm as f64 / 100.0,
-        confirm_reads = config.confirm_reads,
-        operator_ui = config.web_enabled,
         health_endpoint = config.health_enabled,
         loki_delivery = loki_metrics.enabled(),
-        lpr_correlation_mode = config.lpr_correlation_mode.as_str(),
         discovery_mode = config.discovery_mode.as_str(),
         gate_mode = config.gate_mode.as_str(),
-        "RFID encoder service ready"
+        "RFID gate service ready"
     );
-    if !config.writes_enabled {
-        warn!(
-            event = "rfid_writes_disabled",
-            "RFID writes are disabled; candidates will be observed but never allocated or modified"
-        );
-    }
 
     loop {
         tokio::select! {
@@ -212,16 +162,6 @@ async fn run(loki_metrics: std::sync::Arc<logging::LokiMetrics>) -> Result<()> {
                 return Ok(());
             }
             _ = timeout_check.tick() => {
-                if let Some(tid) = engine.expire_in_flight(Instant::now(), config.access_timeout) {
-                    let reason = "tag access/read-back inventory confirmation timed out";
-                    store.mark_access_failed(
-                        &tid,
-                        reason,
-                        config.retry_cooldown,
-                        config.max_attempts,
-                    )?;
-                    warn!(event = "encoding_transaction_timed_out", %tid, "encoding transaction timed out and was released for retry");
-                }
                 if config.discovery_mode.enabled() {
                     match tokio::time::timeout(
                         DISCOVERY_LPR_RETRY_PASS_TIMEOUT,
@@ -246,10 +186,7 @@ async fn run(loki_metrics: std::sync::Arc<logging::LokiMetrics>) -> Result<()> {
                 };
                 if let Err(error) = handle_event(
                     &config,
-                    &reader,
                     &mut store,
-                    &mut engine,
-                    &mut dry_run_reported,
                     &mut gate,
                     event,
                 ).await {
@@ -280,130 +217,23 @@ async fn shutdown_signal() -> Result<()> {
 
 async fn handle_event(
     config: &Config,
-    reader: &ImpinjClient,
     store: &mut Store,
-    engine: &mut Engine,
-    dry_run_reported: &mut HashSet<String>,
     gate: &mut GateRuntime,
     event: ReaderEvent,
 ) -> Result<()> {
-    if let Some(discovery) = DiscoveryObservation::from_reader_event(&event) {
-        if discovery.antenna_port == config.antenna_port
-            && discovery.peak_rssi_cdbm >= config.discovery_min_rssi_cdbm
-            && discovery.epc != config.default_epc
-        {
-            let already_encoded = if let Some(tid) = &discovery.tid {
-                store.get_by_tid(tid)?.is_some()
-            } else {
-                store.has_encoding_epc(&discovery.epc)?
-            };
-            if !already_encoded {
-                if config.discovery_mode.enabled() {
-                    maybe_learn_discovered_tag(config, gate, store, &discovery).await?;
-                }
-                maybe_unlock_gate_identity(config, gate, store, &discovery.tag_key, &discovery.epc)
-                    .await?;
-            }
-        }
-    }
-
-    let Some(observation) = TagObservation::from_reader_event(&event) else {
+    let Some(observation) = DiscoveryObservation::from_reader_event(&event) else {
         return Ok(());
     };
-    let assignment = store.get_by_tid(&observation.tid)?;
-    if assignment.as_ref().is_some_and(|encoding| {
-        encoding.status == "completed" && encoding.assigned_epc == observation.epc
-    }) {
-        store.record_seen(
-            &observation.tid,
-            &observation.epc,
-            observation.peak_rssi_cdbm,
-        )?;
-        maybe_correlate_lpr(config, gate, store, &observation).await?;
-        maybe_unlock_gate_identity(config, gate, store, &observation.tid, &observation.epc).await?;
+    if observation.antenna_port != config.antenna_port {
+        return Ok(());
     }
-    let action = engine.observe(&observation, assignment.as_ref(), Instant::now());
 
-    match action {
-        Action::None => {}
-        Action::CandidateReady { tid } => {
-            if !config.writes_enabled {
-                if dry_run_reported.insert(tid.clone()) {
-                    info!(
-                        event = "encoding_candidate_ready",
-                        mode = "dry-run",
-                        %tid,
-                        rssi_dbm = observation.peak_rssi_cdbm as f64 / 100.0,
-                        "dry-run candidate satisfied all encoding gates"
-                    );
-                }
-                return Ok(());
-            }
-
-            let prefix = config
-                .epc_prefix
-                .as_deref()
-                .context("missing EPC prefix while writes are enabled")?;
-            let encoding = match assignment {
-                Some(encoding) => encoding,
-                None => store.allocate(&tid, prefix)?,
-            };
-            if !encoding.may_attempt(now_ms(), config.max_attempts) {
-                return Ok(());
-            }
-
-            match reader
-                .queue_epc_write(
-                    &encoding.tid,
-                    &encoding.assigned_epc,
-                    config.tag_access_password.as_deref(),
-                )
-                .await
-            {
-                Ok(()) => {
-                    store.mark_queued(&encoding.tid)?;
-                    engine.set_in_flight(encoding.tid.clone(), Instant::now());
-                    info!(
-                        event = "epc_write_queued",
-                        tid = %encoding.tid,
-                        epc = %encoding.assigned_epc,
-                        attempt = encoding.attempts + 1,
-                        "queued exact-TID EPC write"
-                    );
-                }
-                Err(error) => {
-                    store.mark_post_failed(
-                        &encoding.tid,
-                        &error.to_string(),
-                        config.retry_cooldown,
-                    )?;
-                    engine.clear_in_flight(&encoding.tid);
-                    return Err(error);
-                }
-            }
-        }
-        Action::AccessVerified { tid, epc } => {
-            store.mark_verified(&tid, &epc)?;
-            info!(event = "epc_write_verified", %tid, %epc, "all EPC words and read-back verified; awaiting inventory confirmation");
-        }
-        Action::AccessFailed { tid, reason } => {
-            store.mark_access_failed(&tid, &reason, config.retry_cooldown, config.max_attempts)?;
-            engine.clear_in_flight(&tid);
-            warn!(event = "epc_write_failed", %tid, %reason, "EPC write transaction failed");
-        }
-        Action::Completed { tid, epc } => {
-            store.mark_completed(&tid, &epc)?;
-            store.record_seen(&tid, &epc, observation.peak_rssi_cdbm)?;
-            engine.clear_in_flight(&tid);
-            info!(event = "encoding_completed", %tid, %epc, "encoding completed and confirmed by normal inventory");
-            maybe_correlate_lpr(config, gate, store, &observation).await?;
-        }
-        Action::Conflict { tid, observed_epc } => {
-            store.mark_conflict(&tid, &observed_epc)?;
-            engine.clear_in_flight(&tid);
-            error!(event = "epc_assignment_conflict", %tid, %observed_epc, "TID reported an EPC different from its durable assignment");
-        }
+    if config.discovery_mode.enabled()
+        && observation.peak_rssi_cdbm >= config.discovery_min_rssi_cdbm
+    {
+        maybe_learn_discovered_tag(config, gate, store, &observation).await?;
     }
+    maybe_unlock_gate_identity(config, gate, store, &observation.tag_key, &observation.epc).await?;
     Ok(())
 }
 
@@ -450,7 +280,7 @@ async fn maybe_learn_discovered_tag(
     }
     if seen.became_long_dwell {
         let reason = "tag remained continuously readable beyond the discovery dwell limit";
-        if config.discovery_mode == LprCorrelationMode::Live
+        if config.discovery_mode == DiscoveryMode::Live
             && store.suspend_discovered_tag(&observation.tag_key, reason)?
         {
             warn!(
@@ -458,7 +288,7 @@ async fn maybe_learn_discovered_tag(
                 tag = %observation.tag_key,
                 "suspended learned tag because it appears stationary near the reader"
             );
-        } else if config.discovery_mode == LprCorrelationMode::DryRun {
+        } else if config.discovery_mode == DiscoveryMode::DryRun {
             warn!(
                 event = "discovered_tag_stationary",
                 mode = "dry-run",
@@ -537,7 +367,7 @@ async fn match_discovery_passage(
                 );
             }
             if invalidated_match
-                && config.discovery_mode == LprCorrelationMode::Live
+                && config.discovery_mode == DiscoveryMode::Live
                 && store.suspend_discovered_tag(
                     &observation.tag_key,
                     "an RFID passage later contained ambiguous LPR evidence",
@@ -563,7 +393,7 @@ async fn match_discovery_passage(
     match outcome {
         PassageMatchOutcome::Duplicate => return Ok(()),
         PassageMatchOutcome::Ambiguous => {
-            if config.discovery_mode == LprCorrelationMode::Live
+            if config.discovery_mode == DiscoveryMode::Live
                 && store.suspend_discovered_tag(
                     &observation.tag_key,
                     "one RFID passage correlated with more than one LPR identity",
@@ -574,7 +404,7 @@ async fn match_discovery_passage(
                     tag = %observation.tag_key,
                     "suspended learned tag after one passage matched multiple vehicles"
                 );
-            } else if config.discovery_mode == LprCorrelationMode::DryRun {
+            } else if config.discovery_mode == DiscoveryMode::DryRun {
                 warn!(
                     event = "discovery_passage_multiple_vehicles",
                     mode = "dry-run",
@@ -595,7 +425,7 @@ async fn match_discovery_passage(
             && assignment.lpr_actor_id == lpr_match.actor_id
             && same_plate_family(&assignment.plate, &lpr_match.plate)
         {
-            if config.discovery_mode == LprCorrelationMode::Live {
+            if config.discovery_mode == DiscoveryMode::Live {
                 store.renew_discovered_lease(
                     &observation.tag_key,
                     &lpr_match.actor_type,
@@ -615,7 +445,7 @@ async fn match_discovery_passage(
             &assignment.plate,
             config.discovery_evidence_retention,
         )?;
-        if config.discovery_mode == LprCorrelationMode::Live
+        if config.discovery_mode == DiscoveryMode::Live
             && conflicts >= config.discovery_conflict_occurrences
             && store.suspend_discovered_tag(
                 &observation.tag_key,
@@ -630,7 +460,7 @@ async fn match_discovery_passage(
                 observed_plate = %lpr_match.plate,
                 "suspended learned tag after repeated conflicting vehicle evidence"
             );
-        } else if config.discovery_mode == LprCorrelationMode::DryRun
+        } else if config.discovery_mode == DiscoveryMode::DryRun
             && conflicts >= config.discovery_conflict_occurrences
         {
             warn!(
@@ -703,7 +533,7 @@ async fn match_discovery_passage(
             return Ok(());
         }
     };
-    if config.discovery_mode == LprCorrelationMode::DryRun {
+    if config.discovery_mode == DiscoveryMode::DryRun {
         if store.record_discovery_candidate_audit(&candidate)? {
             info!(
                 event = "discovery_candidate_ready",
@@ -828,190 +658,6 @@ fn pending_discovery_observation(
         peak_rssi_cdbm: passage.peak_rssi_cdbm,
         observed_at_ms: passage.last_seen_ms,
     }
-}
-
-async fn maybe_correlate_lpr(
-    config: &Config,
-    gate: &mut GateRuntime,
-    store: &mut Store,
-    observation: &TagObservation,
-) -> Result<()> {
-    if config.lpr_correlation_mode == LprCorrelationMode::Disabled
-        || store.get_active_owner(&observation.tid)?.is_some()
-    {
-        return Ok(());
-    }
-
-    let attempt_time = Instant::now();
-    if gate
-        .lpr_last_attempts
-        .get(&observation.tid)
-        .is_some_and(|last| attempt_time.duration_since(*last) < config.lpr_correlation_poll)
-    {
-        return Ok(());
-    }
-    gate.lpr_last_attempts
-        .insert(observation.tid.clone(), attempt_time);
-
-    let now = Utc::now();
-    let now_ms = now.timestamp_millis();
-    let recent_tids = store.recent_never_assigned_tids(config.lpr_correlation_window)?;
-    if recent_tids.len() != 1 || recent_tids[0] != observation.tid {
-        if recent_tids.iter().any(|tid| tid == &observation.tid) && recent_tids.len() > 1 {
-            for tid in &recent_tids {
-                store.advance_lpr_correlation_not_before(tid, now_ms)?;
-            }
-            warn!(
-                event = "lpr_correlation_multiple_tags",
-                tid = %observation.tid,
-                tag_count = recent_tids.len(),
-                "LPR correlation deferred because multiple unassigned RFID tags are present; a new plate event will be required"
-            );
-        }
-        return Ok(());
-    }
-
-    let window_ms = i64::try_from(config.lpr_correlation_window.as_millis()).unwrap_or(i64::MAX);
-    let window_start_ms = now_ms.saturating_sub(window_ms);
-    let since_ms = store
-        .lpr_correlation_not_before_ms(&observation.tid)?
-        .map_or(window_start_ms, |cutoff| cutoff.max(window_start_ms));
-    let since = DateTime::<Utc>::from_timestamp_millis(since_ms)
-        .context("LPR correlation cutoff is outside the supported date range")?;
-    if since >= now {
-        return Ok(());
-    }
-    let unifi = gate
-        .unifi
-        .as_ref()
-        .context("LPR correlation requires a UniFi Access client")?;
-
-    match unifi.find_lpr_user_match(since, now).await? {
-        LprCorrelation::NoMatch => {}
-        LprCorrelation::Ambiguous { reason } => {
-            store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
-            let detail = serde_json::json!({"reason": reason}).to_string();
-            store.record_lpr_correlation_audit(
-                &observation.tid,
-                &observation.epc,
-                "lpr-correlation-ambiguous",
-                &detail,
-            )?;
-            warn!(
-                event = "lpr_correlation_ambiguous",
-                tid = %observation.tid,
-                epc = %observation.epc,
-                %reason,
-                "LPR correlation was ambiguous; a new plate event will be required"
-            );
-        }
-        LprCorrelation::Match(candidate) => {
-            if candidate.actor_type != "user" {
-                store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
-                let detail = serde_json::json!({
-                    "reason": "visitor-backed LPR evidence requires manual resident association",
-                    "plate": candidate.plate,
-                    "lpr_actor_type": candidate.actor_type,
-                    "lpr_actor_id": candidate.actor_id,
-                })
-                .to_string();
-                store.record_lpr_correlation_audit(
-                    &observation.tid,
-                    &observation.epc,
-                    "lpr-correlation-visitor",
-                    &detail,
-                )?;
-                info!(
-                    event = "lpr_correlation_needs_resident",
-                    direction = "entry",
-                    tid = %observation.tid,
-                    plate = %candidate.plate,
-                    visitor_id = %candidate.actor_id,
-                    "visitor-backed LPR evidence requires manual resident association"
-                );
-                return Ok(());
-            }
-            let user = match unifi.validate_claim_user(&candidate.actor_id).await {
-                Ok(user) => user,
-                Err(error) => {
-                    store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
-                    let detail = serde_json::json!({
-                        "reason": error.to_string(),
-                        "plate": candidate.plate,
-                        "unifi_user_id": candidate.actor_id,
-                    })
-                    .to_string();
-                    store.record_lpr_correlation_audit(
-                        &observation.tid,
-                        &observation.epc,
-                        "lpr-correlation-ambiguous",
-                        &detail,
-                    )?;
-                    warn!(
-                        event = "lpr_correlation_user_validation_failed",
-                        tid = %observation.tid,
-                        user_id = %candidate.actor_id,
-                        %error,
-                        "LPR user failed the ownership eligibility check; a new plate event will be required"
-                    );
-                    return Ok(());
-                }
-            };
-            let detail = serde_json::json!({
-                "plate": candidate.plate,
-                "unifi_user_id": user.id,
-                "unifi_user_name": user.display_name(),
-                "lpr_timestamp": candidate.timestamp.to_rfc3339(),
-            })
-            .to_string();
-            if config.lpr_correlation_mode == LprCorrelationMode::DryRun {
-                store.record_lpr_correlation_audit(
-                    &observation.tid,
-                    &observation.epc,
-                    "lpr-correlation-dry-run",
-                    &detail,
-                )?;
-                store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
-                info!(
-                    event = "lpr_correlation_match",
-                    mode = "dry-run",
-                    decision = "would-assign",
-                    direction = "entry",
-                    tid = %observation.tid,
-                    plate = %candidate.plate,
-                    user_id = %user.id,
-                    user = %user.display_name(),
-                    "dry run: LPR event would assign RFID tag to existing UniFi user"
-                );
-                return Ok(());
-            }
-
-            let vehicle = format!("License plate {}", candidate.plate);
-            store.claim_tag(
-                &observation.tid,
-                &user.id,
-                &user.display_name(),
-                Some(&vehicle),
-                config.claim_window,
-            )?;
-            // The successful LPR event already opened the gate. Avoid a redundant
-            // remote unlock on the same pass when RFID gate mode is also enabled.
-            gate.last_attempts
-                .insert(observation.tid.clone(), Instant::now());
-            info!(
-                event = "lpr_correlation_match",
-                mode = "live",
-                decision = "assigned",
-                direction = "entry",
-                tid = %observation.tid,
-                plate = %candidate.plate,
-                user_id = %user.id,
-                user = %user.display_name(),
-                "assigned RFID tag to the existing UniFi user matched by Entry Gate LPR"
-            );
-        }
-    }
-    Ok(())
 }
 
 async fn maybe_unlock_gate_identity(
@@ -1158,41 +804,16 @@ async fn maybe_unlock_gate_identity(
     Ok(())
 }
 
-fn status(limit: usize) -> Result<()> {
-    let store = Store::open(&state_db_path(), "status")?;
-    println!("SEQUENCE\tSTATUS\tATTEMPTS\tTID\tEPC\tLAST ERROR");
-    for encoding in store.list(limit)? {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            encoding.sequence,
-            encoding.status,
-            encoding.attempts,
-            encoding.tid,
-            encoding.assigned_epc,
-            encoding.last_error.as_deref().unwrap_or("")
-        );
-    }
-    Ok(())
-}
-
-fn retry(tid: &str) -> Result<()> {
-    let tid = normalize_hex(tid, None, "TID")?;
-    let mut store = Store::open(&state_db_path(), "manual-cli")?;
-    store.retry(&tid)?;
-    println!("reset {tid} for a controlled retry");
-    Ok(())
-}
-
 fn gate_events(limit: usize) -> Result<()> {
     let store = Store::open(&state_db_path(), "status")?;
-    println!("TIMESTAMP\tMODE\tDECISION\tTID\tEPC\tUNIFI USER\tDETAIL");
+    println!("TIMESTAMP\tMODE\tDECISION\tTAG KEY\tEPC\tUNIFI USER\tDETAIL");
     for event in store.list_gate_events(limit)? {
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             event.timestamp,
             event.mode,
             event.decision,
-            event.tid,
+            event.tag_key,
             event.epc,
             event.unifi_user_id.as_deref().unwrap_or(""),
             one_line(event.detail.as_deref().unwrap_or(""))
@@ -1375,6 +996,7 @@ mod tests {
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
+    use fcr_rfid_encoder::store::now_ms;
 
     const USER_ID: &str = "17d2f099-99df-429b-becb-1399a6937e5a";
     const DOOR_ID: &str = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
@@ -1509,27 +1131,12 @@ mod tests {
             antenna_port: 1,
             transmit_power_cdbm: 3000,
             rf_mode: 4,
-            writes_enabled: false,
-            default_epc: "300833B2DDD9014000000000".into(),
-            epc_prefix: None,
-            min_rssi_cdbm: -5000,
-            confirm_reads: 5,
-            confirm_window: Duration::from_secs(1),
-            access_timeout: Duration::from_secs(15),
-            retry_cooldown: Duration::from_secs(3),
-            max_attempts: 3,
             state_db: db,
-            tag_access_password: None,
             actor: "test".into(),
-            web_enabled: false,
             health_enabled: false,
             health_stale_after: Duration::from_secs(120),
             web_bind: "127.0.0.1:8080".parse().unwrap(),
-            claim_window: Duration::from_secs(60),
-            lpr_correlation_mode: LprCorrelationMode::Disabled,
-            lpr_correlation_window: Duration::from_secs(10),
-            lpr_correlation_poll: Duration::from_secs(2),
-            discovery_mode: LprCorrelationMode::Disabled,
+            discovery_mode: DiscoveryMode::Disabled,
             discovery_match_window: Duration::from_secs(10),
             discovery_poll: Duration::from_secs(2),
             discovery_passage_gap: Duration::from_secs(30),
@@ -1548,37 +1155,6 @@ mod tests {
             unifi_verify_tls: false,
             unifi_ca_certificate: None,
             entry_gate_door_id: DOOR_ID.into(),
-        }
-    }
-
-    fn assigned_tag(store: &mut Store) -> TagObservation {
-        let observation = unassigned_tag(store);
-        store
-            .claim_tag(
-                &observation.tid,
-                USER_ID,
-                "Example User",
-                None,
-                Duration::from_secs(60),
-            )
-            .unwrap();
-        observation
-    }
-
-    fn unassigned_tag(store: &mut Store) -> TagObservation {
-        let encoding = store.allocate("E2801111", "FCA7000100000000").unwrap();
-        store
-            .mark_completed(&encoding.tid, &encoding.assigned_epc)
-            .unwrap();
-        store
-            .record_seen(&encoding.tid, &encoding.assigned_epc, -4200)
-            .unwrap();
-        TagObservation {
-            tid: encoding.tid,
-            epc: encoding.assigned_epc,
-            antenna_port: 1,
-            peak_rssi_cdbm: -4200,
-            access_responses: Vec::new(),
         }
     }
 
@@ -1653,6 +1229,38 @@ mod tests {
             .unwrap();
     }
 
+    fn assigned_tag(store: &mut Store) -> DiscoveryObservation {
+        let observation = discovered_tid("E2801111", "300833B2DDD9014000000000");
+        record_ready_discovery_candidate(
+            store,
+            &observation.tag_key,
+            observation.identity_kind,
+            &observation.epc,
+            "user",
+            USER_ID,
+        );
+        let candidate = store
+            .discovery_candidate(
+                &observation.tag_key,
+                Duration::from_secs(60 * 86_400),
+                1,
+                1,
+                100,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .activate_discovered_tag(
+                &candidate,
+                USER_ID,
+                "Example User",
+                Duration::from_secs(60 * 86_400),
+            )
+            .unwrap();
+        observation
+    }
+
     #[test]
     fn associate_discovered_accepts_explicit_dry_run_and_rejects_both_modes() {
         let dry_run = Cli::try_parse_from([
@@ -1695,7 +1303,6 @@ mod tests {
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&dry_run).unwrap()),
             last_attempts: HashMap::new(),
-            lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
             discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
@@ -1705,7 +1312,7 @@ mod tests {
             &dry_run,
             &mut gate,
             &mut store,
-            &observation.tid,
+            &observation.tag_key,
             &observation.epc,
         )
         .await
@@ -1724,7 +1331,6 @@ mod tests {
         let mut live_gate = GateRuntime {
             unifi: Some(UnifiClient::new(&live).unwrap()),
             last_attempts: HashMap::new(),
-            lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
             discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
@@ -1733,7 +1339,7 @@ mod tests {
             &live,
             &mut live_gate,
             &mut store,
-            &observation.tid,
+            &observation.tag_key,
             &observation.epc,
         )
         .await
@@ -1756,7 +1362,6 @@ mod tests {
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
             last_attempts: HashMap::new(),
-            lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
             discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
@@ -1766,7 +1371,7 @@ mod tests {
             &config,
             &mut gate,
             &mut store,
-            &observation.tid,
+            &observation.tag_key,
             &observation.epc,
         )
         .await
@@ -1786,82 +1391,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_new_clean_lpr_event_resolves_durable_first_pass_ambiguity() {
-        let (base_url, counts, server) = mock_unifi(true).await;
-        let directory = tempdir().unwrap();
-        let db = directory.path().join("state.sqlite3");
-        let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
-        config.lpr_correlation_mode = LprCorrelationMode::Live;
-        config.lpr_correlation_poll = Duration::from_millis(1);
-        let mut store = Store::open(&db, "gate-auto").unwrap();
-        let observation = unassigned_tag(&mut store);
-        let first_event = Utc::now() - chrono::Duration::seconds(1);
-        *counts.lpr_hits.lock().unwrap() = vec![
-            lpr_hit(first_event, "ABC123", "ACCESS"),
-            lpr_hit(first_event, "XYZ789", "BLOCKED"),
-        ];
-        let mut gate = GateRuntime {
-            unifi: Some(UnifiClient::new(&config).unwrap()),
-            last_attempts: HashMap::new(),
-            lpr_last_attempts: HashMap::new(),
-            discovery_last_attempts: HashMap::new(),
-            discovery_retry_attempts: HashMap::new(),
-            discovery_lpr_cache: None,
-        };
-
-        maybe_correlate_lpr(&config, &mut gate, &mut store, &observation)
-            .await
-            .unwrap();
-        assert!(store.get_active_owner(&observation.tid).unwrap().is_none());
-        assert!(
-            store
-                .lpr_correlation_not_before_ms(&observation.tid)
-                .unwrap()
-                .is_some()
-        );
-
-        // Reopen the database to prove the ambiguity cutoff survives a service
-        // restart. Elapsed wall-clock time does not affect future eligibility.
-        drop(store);
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        let clean_event = Utc::now();
-        counts
-            .lpr_hits
-            .lock()
-            .unwrap()
-            .push(lpr_hit(clean_event, "ABC123", "ACCESS"));
-        let mut store = Store::open(&db, "gate-auto").unwrap();
-        let mut restarted_gate = GateRuntime {
-            unifi: Some(UnifiClient::new(&config).unwrap()),
-            last_attempts: HashMap::new(),
-            lpr_last_attempts: HashMap::new(),
-            discovery_last_attempts: HashMap::new(),
-            discovery_retry_attempts: HashMap::new(),
-            discovery_lpr_cache: None,
-        };
-
-        maybe_correlate_lpr(&config, &mut restarted_gate, &mut store, &observation)
-            .await
-            .unwrap();
-
-        let owner = store.get_active_owner(&observation.tid).unwrap().unwrap();
-        assert_eq!(owner.unifi_user_id, USER_ID);
-        assert_eq!(
-            owner.vehicle_description.as_deref(),
-            Some("License plate ABC123")
-        );
-        assert_eq!(counts.lpr_reads.load(Ordering::SeqCst), 2);
-        assert_eq!(counts.unlocks.load(Ordering::SeqCst), 0);
-        server.abort();
-    }
-
-    #[tokio::test]
     async fn multi_visit_discovery_activates_an_existing_tag_without_redundant_unlock() {
         let (base_url, counts, server) = mock_unifi(true).await;
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Live);
-        config.discovery_mode = LprCorrelationMode::Live;
+        config.discovery_mode = DiscoveryMode::Live;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;
@@ -1876,7 +1411,6 @@ mod tests {
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
             last_attempts: HashMap::new(),
-            lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
             discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
@@ -1913,7 +1447,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
-        config.discovery_mode = LprCorrelationMode::DryRun;
+        config.discovery_mode = DiscoveryMode::DryRun;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;
@@ -1928,7 +1462,6 @@ mod tests {
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
             last_attempts: HashMap::new(),
-            lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
             discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
@@ -1969,7 +1502,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
-        config.discovery_mode = LprCorrelationMode::DryRun;
+        config.discovery_mode = DiscoveryMode::DryRun;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;
@@ -1987,7 +1520,6 @@ mod tests {
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
             last_attempts: HashMap::new(),
-            lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
             discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
@@ -2028,7 +1560,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
-        config.discovery_mode = LprCorrelationMode::DryRun;
+        config.discovery_mode = DiscoveryMode::DryRun;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;
@@ -2041,7 +1573,6 @@ mod tests {
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
             last_attempts: HashMap::new(),
-            lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
             discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
@@ -2078,7 +1609,6 @@ mod tests {
         let mut restarted_gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
             last_attempts: HashMap::new(),
-            lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
             discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
@@ -2197,7 +1727,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Live);
-        config.discovery_mode = LprCorrelationMode::Live;
+        config.discovery_mode = DiscoveryMode::Live;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;
@@ -2215,7 +1745,6 @@ mod tests {
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
             last_attempts: HashMap::new(),
-            lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
             discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
@@ -2247,7 +1776,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
-        config.discovery_mode = LprCorrelationMode::Live;
+        config.discovery_mode = DiscoveryMode::Live;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;
@@ -2264,7 +1793,6 @@ mod tests {
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
             last_attempts: HashMap::new(),
-            lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
             discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,
@@ -2299,7 +1827,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
-        config.discovery_mode = LprCorrelationMode::Live;
+        config.discovery_mode = DiscoveryMode::Live;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;
@@ -2311,7 +1839,6 @@ mod tests {
         let mut gate = GateRuntime {
             unifi: Some(UnifiClient::new(&config).unwrap()),
             last_attempts: HashMap::new(),
-            lpr_last_attempts: HashMap::new(),
             discovery_last_attempts: HashMap::new(),
             discovery_retry_attempts: HashMap::new(),
             discovery_lpr_cache: None,

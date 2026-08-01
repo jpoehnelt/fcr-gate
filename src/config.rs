@@ -7,7 +7,6 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-pub const DEFAULT_UNENCODED_EPC: &str = "300833B2DDD9014000000000";
 pub const DEFAULT_UNIFI_ACCESS_HOST: &str = "https://100.89.168.42:12445";
 pub const DEFAULT_ENTRY_GATE_DOOR_ID: &str = "1b620b81-f457-45f7-9fd2-27de1d8c4fdc";
 
@@ -19,13 +18,13 @@ pub enum GateMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LprCorrelationMode {
+pub enum DiscoveryMode {
     Disabled,
     DryRun,
     Live,
 }
 
-impl LprCorrelationMode {
+impl DiscoveryMode {
     pub fn enabled(self) -> bool {
         self != Self::Disabled
     }
@@ -64,27 +63,12 @@ pub struct Config {
     pub antenna_port: u16,
     pub transmit_power_cdbm: i32,
     pub rf_mode: u16,
-    pub writes_enabled: bool,
-    pub default_epc: String,
-    pub epc_prefix: Option<String>,
-    pub min_rssi_cdbm: i32,
-    pub confirm_reads: u32,
-    pub confirm_window: Duration,
-    pub access_timeout: Duration,
-    pub retry_cooldown: Duration,
-    pub max_attempts: u32,
     pub state_db: PathBuf,
-    pub tag_access_password: Option<String>,
     pub actor: String,
-    pub web_enabled: bool,
     pub health_enabled: bool,
     pub health_stale_after: Duration,
     pub web_bind: SocketAddr,
-    pub claim_window: Duration,
-    pub lpr_correlation_mode: LprCorrelationMode,
-    pub lpr_correlation_window: Duration,
-    pub lpr_correlation_poll: Duration,
-    pub discovery_mode: LprCorrelationMode,
+    pub discovery_mode: DiscoveryMode,
     pub discovery_match_window: Duration,
     pub discovery_poll: Duration,
     pub discovery_passage_gap: Duration,
@@ -117,43 +101,12 @@ impl Config {
             bail!("IMPINJ_CA_CERTIFICATE requires IMPINJ_TLS_VERIFY=true");
         }
 
-        let writes_enabled = boolean("RFID_WRITES_ENABLED", false)?;
-        let default_epc = normalize_hex(
-            &env::var("RFID_DEFAULT_EPC").unwrap_or_else(|_| DEFAULT_UNENCODED_EPC.into()),
-            Some(24),
-            "RFID_DEFAULT_EPC",
-        )?;
-        let epc_prefix = env::var("RFID_EPC_PREFIX")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| normalize_hex(&value, Some(16), "RFID_EPC_PREFIX"))
-            .transpose()?;
-        if writes_enabled && epc_prefix.is_none() {
-            bail!("RFID_EPC_PREFIX is required when RFID_WRITES_ENABLED=true");
-        }
-
-        let tag_access_password = env::var("IMPINJ_TAG_ACCESS_PASSWORD")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| normalize_hex(&value, Some(8), "IMPINJ_TAG_ACCESS_PASSWORD"))
-            .transpose()?;
         let profile_id = validate_profile_id(
-            &env::var("IMPINJ_PROFILE_ID").unwrap_or_else(|_| "fcr-gate-encoder".into()),
+            &env::var("IMPINJ_PROFILE_ID").unwrap_or_else(|_| "fcr-gate-reader".into()),
         )?;
-        let web_enabled = boolean("FCR_GATE_WEB_ENABLED", false)?;
         let health_enabled = boolean("FCR_GATE_HEALTH_ENABLED", true)?;
         let gate_mode =
             parse_gate_mode(&env::var("RFID_GATE_MODE").unwrap_or_else(|_| "disabled".into()))?;
-        let lpr_correlation_mode = parse_lpr_correlation_mode(
-            &env::var("RFID_LPR_CORRELATION_MODE").unwrap_or_else(|_| "disabled".into()),
-        )?;
-        let lpr_correlation_window =
-            Duration::from_millis(positive_number("RFID_LPR_CORRELATION_WINDOW_MS", 10_000)?);
-        let lpr_correlation_poll =
-            Duration::from_millis(positive_number("RFID_LPR_CORRELATION_POLL_MS", 2_000)?);
-        if lpr_correlation_poll > lpr_correlation_window {
-            bail!("RFID_LPR_CORRELATION_POLL_MS must not exceed RFID_LPR_CORRELATION_WINDOW_MS");
-        }
         let discovery_mode = parse_discovery_mode(
             &env::var("RFID_DISCOVERY_MODE").unwrap_or_else(|_| "disabled".into()),
         )?;
@@ -177,10 +130,7 @@ impl Config {
             bail!("RFID_DISCOVERY_MIN_CONFIDENCE_PERCENT must not exceed 100");
         }
         let web_bind = web_bind()?;
-        let unifi_needed = web_enabled
-            || gate_mode.enabled()
-            || lpr_correlation_mode.enabled()
-            || discovery_mode.enabled();
+        let unifi_needed = gate_mode.enabled() || discovery_mode.enabled();
         let unifi_base_url = unifi_needed
             .then(|| {
                 normalize_url(
@@ -197,7 +147,7 @@ impl Config {
         };
         if unifi_needed && unifi_api_key.is_none() {
             bail!(
-                "UNIFI_API_KEY_FILE or UNIFI_API_KEY is required for the operator UI, LPR correlation, RFID discovery, or gate unlock"
+                "UNIFI_API_KEY_FILE or UNIFI_API_KEY is required for RFID discovery or gate unlock"
             );
         }
         let unifi_verify_tls = boolean("UNIFI_TLS_VERIFY", false)?;
@@ -221,32 +171,14 @@ impl Config {
             antenna_port: number("IMPINJ_ANTENNA_PORT", 1)?,
             transmit_power_cdbm: number("IMPINJ_TX_POWER_CDBM", 3000)?,
             rf_mode: number("IMPINJ_RF_MODE", 4)?,
-            writes_enabled,
-            default_epc,
-            epc_prefix,
-            min_rssi_cdbm: number("RFID_MIN_RSSI_CDBM", -5000)?,
-            confirm_reads: positive_number("RFID_CONFIRM_READS", 5)?,
-            confirm_window: Duration::from_millis(positive_number("RFID_CONFIRM_WINDOW_MS", 1500)?),
-            access_timeout: Duration::from_millis(positive_number(
-                "RFID_ACCESS_TIMEOUT_MS",
-                15_000,
-            )?),
-            retry_cooldown: Duration::from_millis(positive_number("RFID_RETRY_COOLDOWN_MS", 3000)?),
-            max_attempts: positive_number("RFID_MAX_ATTEMPTS", 3)?,
             state_db: state_db_path(),
-            tag_access_password,
-            actor: env::var("RFID_ENCODER_ACTOR").unwrap_or_else(|_| "gate-auto".into()),
-            web_enabled,
+            actor: env::var("RFID_SERVICE_ACTOR").unwrap_or_else(|_| "gate-auto".into()),
             health_enabled,
             health_stale_after: Duration::from_millis(positive_number(
                 "FCR_GATE_HEALTH_STALE_MS",
                 120_000,
             )?),
             web_bind,
-            claim_window: Duration::from_millis(positive_number("RFID_CLAIM_WINDOW_MS", 60_000)?),
-            lpr_correlation_mode,
-            lpr_correlation_window,
-            lpr_correlation_poll,
             discovery_mode,
             discovery_match_window,
             discovery_poll,
@@ -285,20 +217,11 @@ fn parse_gate_mode(value: &str) -> Result<GateMode> {
     }
 }
 
-fn parse_lpr_correlation_mode(value: &str) -> Result<LprCorrelationMode> {
+fn parse_discovery_mode(value: &str) -> Result<DiscoveryMode> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "disabled" | "off" => Ok(LprCorrelationMode::Disabled),
-        "dry-run" | "dry_run" | "dryrun" => Ok(LprCorrelationMode::DryRun),
-        "live" => Ok(LprCorrelationMode::Live),
-        _ => bail!("RFID_LPR_CORRELATION_MODE must be disabled, dry-run, or live"),
-    }
-}
-
-fn parse_discovery_mode(value: &str) -> Result<LprCorrelationMode> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "disabled" | "off" => Ok(LprCorrelationMode::Disabled),
-        "dry-run" | "dry_run" | "dryrun" => Ok(LprCorrelationMode::DryRun),
-        "live" => Ok(LprCorrelationMode::Live),
+        "disabled" | "off" => Ok(DiscoveryMode::Disabled),
+        "dry-run" | "dry_run" | "dryrun" => Ok(DiscoveryMode::DryRun),
+        "live" => Ok(DiscoveryMode::Live),
         _ => bail!("RFID_DISCOVERY_MODE must be disabled, dry-run, or live"),
     }
 }
@@ -514,36 +437,16 @@ mod tests {
     }
 
     #[test]
-    fn lpr_correlation_mode_has_an_explicit_dry_run() {
-        assert_eq!(
-            parse_lpr_correlation_mode("disabled").unwrap(),
-            LprCorrelationMode::Disabled
-        );
-        assert_eq!(
-            parse_lpr_correlation_mode("dry-run").unwrap(),
-            LprCorrelationMode::DryRun
-        );
-        assert_eq!(
-            parse_lpr_correlation_mode("live").unwrap(),
-            LprCorrelationMode::Live
-        );
-        assert!(parse_lpr_correlation_mode("true").is_err());
-    }
-
-    #[test]
     fn discovery_mode_has_an_explicit_dry_run() {
         assert_eq!(
             parse_discovery_mode("disabled").unwrap(),
-            LprCorrelationMode::Disabled
+            DiscoveryMode::Disabled
         );
         assert_eq!(
             parse_discovery_mode("dry-run").unwrap(),
-            LprCorrelationMode::DryRun
+            DiscoveryMode::DryRun
         );
-        assert_eq!(
-            parse_discovery_mode("live").unwrap(),
-            LprCorrelationMode::Live
-        );
+        assert_eq!(parse_discovery_mode("live").unwrap(), DiscoveryMode::Live);
         assert!(parse_discovery_mode("true").is_err());
     }
 }
