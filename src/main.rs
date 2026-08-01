@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use fcr_rfid_encoder::{
-    config::{Config, GateMode, LprCorrelationMode, normalize_hex, state_db_path},
+    config::{Config, DiscoveryMode, GateMode, normalize_hex, state_db_path},
     impinj::ImpinjClient,
     logging,
     model::{DiscoveryObservation, ReaderEvent},
@@ -118,13 +118,13 @@ async fn run(loki_metrics: std::sync::Arc<logging::LokiMetrics>) -> Result<()> {
         .then(|| UnifiClient::new(&config))
         .transpose()?;
 
-    let (sender, mut receiver) = mpsc::channel::<ReaderEvent>(4096);
-    let stream_task = tokio::spawn(reader.clone().stream_events(sender));
     let web_handle = if config.health_enabled {
         Some(web::start(&config, reader_health, std::sync::Arc::clone(&loki_metrics)).await?)
     } else {
         None
     };
+    let (sender, mut receiver) = mpsc::channel::<ReaderEvent>(4096);
+    let stream_task = tokio::spawn(reader.clone().stream_events(sender));
     let mut gate = GateRuntime {
         unifi,
         last_attempts: HashMap::new(),
@@ -224,13 +224,13 @@ async fn handle_event(
     let Some(observation) = DiscoveryObservation::from_reader_event(&event) else {
         return Ok(());
     };
-    if observation.antenna_port != config.antenna_port
-        || observation.peak_rssi_cdbm < config.discovery_min_rssi_cdbm
-    {
+    if observation.antenna_port != config.antenna_port {
         return Ok(());
     }
 
-    if config.discovery_mode.enabled() {
+    if config.discovery_mode.enabled()
+        && observation.peak_rssi_cdbm >= config.discovery_min_rssi_cdbm
+    {
         maybe_learn_discovered_tag(config, gate, store, &observation).await?;
     }
     maybe_unlock_gate_identity(config, gate, store, &observation.tag_key, &observation.epc).await?;
@@ -280,7 +280,7 @@ async fn maybe_learn_discovered_tag(
     }
     if seen.became_long_dwell {
         let reason = "tag remained continuously readable beyond the discovery dwell limit";
-        if config.discovery_mode == LprCorrelationMode::Live
+        if config.discovery_mode == DiscoveryMode::Live
             && store.suspend_discovered_tag(&observation.tag_key, reason)?
         {
             warn!(
@@ -288,7 +288,7 @@ async fn maybe_learn_discovered_tag(
                 tag = %observation.tag_key,
                 "suspended learned tag because it appears stationary near the reader"
             );
-        } else if config.discovery_mode == LprCorrelationMode::DryRun {
+        } else if config.discovery_mode == DiscoveryMode::DryRun {
             warn!(
                 event = "discovered_tag_stationary",
                 mode = "dry-run",
@@ -367,7 +367,7 @@ async fn match_discovery_passage(
                 );
             }
             if invalidated_match
-                && config.discovery_mode == LprCorrelationMode::Live
+                && config.discovery_mode == DiscoveryMode::Live
                 && store.suspend_discovered_tag(
                     &observation.tag_key,
                     "an RFID passage later contained ambiguous LPR evidence",
@@ -393,7 +393,7 @@ async fn match_discovery_passage(
     match outcome {
         PassageMatchOutcome::Duplicate => return Ok(()),
         PassageMatchOutcome::Ambiguous => {
-            if config.discovery_mode == LprCorrelationMode::Live
+            if config.discovery_mode == DiscoveryMode::Live
                 && store.suspend_discovered_tag(
                     &observation.tag_key,
                     "one RFID passage correlated with more than one LPR identity",
@@ -404,7 +404,7 @@ async fn match_discovery_passage(
                     tag = %observation.tag_key,
                     "suspended learned tag after one passage matched multiple vehicles"
                 );
-            } else if config.discovery_mode == LprCorrelationMode::DryRun {
+            } else if config.discovery_mode == DiscoveryMode::DryRun {
                 warn!(
                     event = "discovery_passage_multiple_vehicles",
                     mode = "dry-run",
@@ -425,7 +425,7 @@ async fn match_discovery_passage(
             && assignment.lpr_actor_id == lpr_match.actor_id
             && same_plate_family(&assignment.plate, &lpr_match.plate)
         {
-            if config.discovery_mode == LprCorrelationMode::Live {
+            if config.discovery_mode == DiscoveryMode::Live {
                 store.renew_discovered_lease(
                     &observation.tag_key,
                     &lpr_match.actor_type,
@@ -445,7 +445,7 @@ async fn match_discovery_passage(
             &assignment.plate,
             config.discovery_evidence_retention,
         )?;
-        if config.discovery_mode == LprCorrelationMode::Live
+        if config.discovery_mode == DiscoveryMode::Live
             && conflicts >= config.discovery_conflict_occurrences
             && store.suspend_discovered_tag(
                 &observation.tag_key,
@@ -460,7 +460,7 @@ async fn match_discovery_passage(
                 observed_plate = %lpr_match.plate,
                 "suspended learned tag after repeated conflicting vehicle evidence"
             );
-        } else if config.discovery_mode == LprCorrelationMode::DryRun
+        } else if config.discovery_mode == DiscoveryMode::DryRun
             && conflicts >= config.discovery_conflict_occurrences
         {
             warn!(
@@ -533,7 +533,7 @@ async fn match_discovery_passage(
             return Ok(());
         }
     };
-    if config.discovery_mode == LprCorrelationMode::DryRun {
+    if config.discovery_mode == DiscoveryMode::DryRun {
         if store.record_discovery_candidate_audit(&candidate)? {
             info!(
                 event = "discovery_candidate_ready",
@@ -806,14 +806,14 @@ async fn maybe_unlock_gate_identity(
 
 fn gate_events(limit: usize) -> Result<()> {
     let store = Store::open(&state_db_path(), "status")?;
-    println!("TIMESTAMP\tMODE\tDECISION\tTID\tEPC\tUNIFI USER\tDETAIL");
+    println!("TIMESTAMP\tMODE\tDECISION\tTAG KEY\tEPC\tUNIFI USER\tDETAIL");
     for event in store.list_gate_events(limit)? {
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             event.timestamp,
             event.mode,
             event.decision,
-            event.tid,
+            event.tag_key,
             event.epc,
             event.unifi_user_id.as_deref().unwrap_or(""),
             one_line(event.detail.as_deref().unwrap_or(""))
@@ -1136,7 +1136,7 @@ mod tests {
             health_enabled: false,
             health_stale_after: Duration::from_secs(120),
             web_bind: "127.0.0.1:8080".parse().unwrap(),
-            discovery_mode: LprCorrelationMode::Disabled,
+            discovery_mode: DiscoveryMode::Disabled,
             discovery_match_window: Duration::from_secs(10),
             discovery_poll: Duration::from_secs(2),
             discovery_passage_gap: Duration::from_secs(30),
@@ -1396,7 +1396,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Live);
-        config.discovery_mode = LprCorrelationMode::Live;
+        config.discovery_mode = DiscoveryMode::Live;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;
@@ -1447,7 +1447,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
-        config.discovery_mode = LprCorrelationMode::DryRun;
+        config.discovery_mode = DiscoveryMode::DryRun;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;
@@ -1502,7 +1502,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
-        config.discovery_mode = LprCorrelationMode::DryRun;
+        config.discovery_mode = DiscoveryMode::DryRun;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;
@@ -1560,7 +1560,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
-        config.discovery_mode = LprCorrelationMode::DryRun;
+        config.discovery_mode = DiscoveryMode::DryRun;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;
@@ -1727,7 +1727,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Live);
-        config.discovery_mode = LprCorrelationMode::Live;
+        config.discovery_mode = DiscoveryMode::Live;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;
@@ -1776,7 +1776,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
-        config.discovery_mode = LprCorrelationMode::Live;
+        config.discovery_mode = DiscoveryMode::Live;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;
@@ -1827,7 +1827,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let db = directory.path().join("state.sqlite3");
         let mut config = test_config(db.clone(), base_url, GateMode::Disabled);
-        config.discovery_mode = LprCorrelationMode::Live;
+        config.discovery_mode = DiscoveryMode::Live;
         config.discovery_min_occurrences = 1;
         config.discovery_min_days = 1;
         config.discovery_min_confidence_percent = 100;

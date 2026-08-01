@@ -14,8 +14,8 @@ compatibility. It does not write EPCs or modify tags.
 ```mermaid
 flowchart LR
     R["Impinj R700"] -->|"inventory events with FastID TID"| S["Rust RFID service"]
-    S -->|"plate events, users, policies, schedules"| U["UniFi Access API"]
-    S -->|"authorized remote unlock"| G["Entry Gate"]
+    S <-->|"plate events, users, policies, schedules; authorized unlock request"| U["UniFi Access API"]
+    U -->|"unlock command"| G["Entry Gate"]
     S --> D["SQLite evidence and ownership"]
     S --> J["journald JSON"]
     S -.->|"best-effort JSON batches"| L["Loki over Tailscale"]
@@ -123,3 +123,7 @@ systemctl restart fcr-rfid-encoder
 The release installer preserves configuration, secrets, and SQLite state across
 upgrades. `deploy/30-fcr-rfid-encoder.sh` restores the systemd unit after UniFi OS
 updates.
+
+The first release without EPC writing removes obsolete writer tables from the
+SQLite database. Any ownership that existed only in the old writer tables must be
+learned again through multi-visit discovery.

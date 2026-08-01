@@ -6,7 +6,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::Serialize;
 
 use crate::plate::{canonical_plate_key, same_plate_family};
@@ -32,7 +34,7 @@ pub struct TagOwner {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GateEvent {
     pub timestamp: String,
-    pub tid: String,
+    pub tag_key: String,
     pub epc: String,
     pub unifi_user_id: Option<String>,
     pub mode: String,
@@ -186,7 +188,7 @@ impl Store {
              CREATE TABLE IF NOT EXISTS gate_events (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  timestamp TEXT NOT NULL,
-                 tid TEXT NOT NULL,
+                 tag_key TEXT NOT NULL,
                  epc TEXT NOT NULL,
                  unifi_user_id TEXT,
                  mode TEXT NOT NULL DEFAULT 'live' CHECK (
@@ -200,6 +202,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS gate_events_timestamp
                  ON gate_events(timestamp DESC);",
         )?;
+        ensure_gate_event_tag_key(&connection)?;
         ensure_gate_event_mode(&connection)?;
         ensure_lpr_actor_columns(&connection)?;
         Ok(Self {
@@ -208,8 +211,13 @@ impl Store {
         })
     }
 
-    pub fn health_check(&self) -> Result<()> {
-        self.connection.query_row("SELECT 1", [], |_| Ok(()))?;
+    pub fn health_check_path(path: &Path) -> Result<()> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("failed to open state database {} read-only", path.display()))?;
+        connection.query_row("SELECT 1", [], |_| Ok(()))?;
         Ok(())
     }
 
@@ -986,7 +994,7 @@ impl Store {
 
     pub fn record_gate_decision(
         &mut self,
-        tid: &str,
+        tag_key: &str,
         epc: &str,
         unifi_user_id: Option<&str>,
         mode: &str,
@@ -1001,16 +1009,24 @@ impl Store {
         }
         self.connection.execute(
             "INSERT INTO gate_events
-                 (timestamp, tid, epc, unifi_user_id, mode, decision, detail)
+                 (timestamp, tag_key, epc, unifi_user_id, mode, decision, detail)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![timestamp(), tid, epc, unifi_user_id, mode, decision, detail],
+            params![
+                timestamp(),
+                tag_key,
+                epc,
+                unifi_user_id,
+                mode,
+                decision,
+                detail
+            ],
         )?;
         Ok(())
     }
 
     pub fn list_gate_events(&self, limit: usize) -> Result<Vec<GateEvent>> {
         let mut statement = self.connection.prepare(
-            "SELECT timestamp, tid, epc, unifi_user_id, mode, decision, detail
+            "SELECT timestamp, tag_key, epc, unifi_user_id, mode, decision, detail
              FROM gate_events ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit as i64], row_to_gate_event)?;
@@ -1038,7 +1054,7 @@ fn audit_tx(
 fn row_to_gate_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<GateEvent> {
     Ok(GateEvent {
         timestamp: row.get(0)?,
-        tid: row.get(1)?,
+        tag_key: row.get(1)?,
         epc: row.get(2)?,
         unifi_user_id: row.get(3)?,
         mode: row.get(4)?,
@@ -1061,6 +1077,16 @@ fn ensure_gate_event_mode(connection: &Connection) -> Result<()> {
          CHECK (mode IN ('dry-run', 'live'))",
         [],
     )?;
+    Ok(())
+}
+
+fn ensure_gate_event_tag_key(connection: &Connection) -> Result<()> {
+    if table_has_column(connection, "gate_events", "tag_key")? {
+        return Ok(());
+    }
+    if table_has_column(connection, "gate_events", "tid")? {
+        connection.execute("ALTER TABLE gate_events RENAME COLUMN tid TO tag_key", [])?;
+    }
     Ok(())
 }
 

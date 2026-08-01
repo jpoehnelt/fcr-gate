@@ -98,9 +98,10 @@ async fn health(State(state): State<AppState>) -> Response {
         .last_activity_ms
         .map(|last| now_ms().saturating_sub(last));
     let reader_ok = age.is_some_and(|age| age >= 0 && age <= state.health_stale_after_ms);
-    let database_ok = Store::open(&state.db_path, "health-check")
-        .and_then(|store| store.health_check())
-        .is_ok();
+    let db_path = Arc::clone(&state.db_path);
+    let database_ok = tokio::task::spawn_blocking(move || Store::health_check_path(&db_path))
+        .await
+        .is_ok_and(|result| result.is_ok());
     let status = if reader_ok && database_ok {
         StatusCode::OK
     } else {
@@ -167,7 +168,9 @@ mod tests {
     #[tokio::test]
     async fn health_endpoint_accepts_recent_reader_activity() {
         let directory = tempdir().unwrap();
-        let app = state(directory.path().join("state.sqlite3"));
+        let db_path = directory.path().join("state.sqlite3");
+        Store::open(&db_path, "test").unwrap();
+        let app = state(db_path);
         app.reader_health.mark_connected();
 
         let response = health(State(app.clone())).await;

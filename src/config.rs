@@ -18,13 +18,13 @@ pub enum GateMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LprCorrelationMode {
+pub enum DiscoveryMode {
     Disabled,
     DryRun,
     Live,
 }
 
-impl LprCorrelationMode {
+impl DiscoveryMode {
     pub fn enabled(self) -> bool {
         self != Self::Disabled
     }
@@ -68,7 +68,7 @@ pub struct Config {
     pub health_enabled: bool,
     pub health_stale_after: Duration,
     pub web_bind: SocketAddr,
-    pub discovery_mode: LprCorrelationMode,
+    pub discovery_mode: DiscoveryMode,
     pub discovery_match_window: Duration,
     pub discovery_poll: Duration,
     pub discovery_passage_gap: Duration,
@@ -217,11 +217,11 @@ fn parse_gate_mode(value: &str) -> Result<GateMode> {
     }
 }
 
-fn parse_discovery_mode(value: &str) -> Result<LprCorrelationMode> {
+fn parse_discovery_mode(value: &str) -> Result<DiscoveryMode> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "disabled" | "off" => Ok(LprCorrelationMode::Disabled),
-        "dry-run" | "dry_run" | "dryrun" => Ok(LprCorrelationMode::DryRun),
-        "live" => Ok(LprCorrelationMode::Live),
+        "disabled" | "off" => Ok(DiscoveryMode::Disabled),
+        "dry-run" | "dry_run" | "dryrun" => Ok(DiscoveryMode::DryRun),
+        "live" => Ok(DiscoveryMode::Live),
         _ => bail!("RFID_DISCOVERY_MODE must be disabled, dry-run, or live"),
     }
 }
@@ -440,16 +440,13 @@ mod tests {
     fn discovery_mode_has_an_explicit_dry_run() {
         assert_eq!(
             parse_discovery_mode("disabled").unwrap(),
-            LprCorrelationMode::Disabled
+            DiscoveryMode::Disabled
         );
         assert_eq!(
             parse_discovery_mode("dry-run").unwrap(),
-            LprCorrelationMode::DryRun
+            DiscoveryMode::DryRun
         );
-        assert_eq!(
-            parse_discovery_mode("live").unwrap(),
-            LprCorrelationMode::Live
-        );
+        assert_eq!(parse_discovery_mode("live").unwrap(), DiscoveryMode::Live);
         assert!(parse_discovery_mode("true").is_err());
     }
 }
