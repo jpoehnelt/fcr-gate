@@ -19,6 +19,8 @@ flowchart LR
     E <-->|"IoT Device Interface"| R["Impinj R700"]
     E -->|"current user + policy + schedule"| UA["UniFi Access API"]
     UA -->|"attributed remote unlock"| G["Entry Gate"]
+    E -->|"complete local JSON log"| J["journald"]
+    E -.->|"best-effort JSON batches"| L["Loki over Tailscale"]
 ```
 
 ## Safety boundary
@@ -29,8 +31,8 @@ flowchart LR
   Cloudflare Access policy determines which identities are allowed.
 - RFID writes default to disabled and require an explicit server-side setting.
 - UniFi gate unlocks use a separate setting and also default to disabled.
-- `/healthz` contains no tag or user data, binds to loopback with the UI, and should
-  use a Cloudflare Access service token for external monitoring.
+- `/healthz` and `/metrics` contain no tag or user data, bind to loopback with the
+  UI, and should use a Cloudflare Access service token for external monitoring.
 - Every write must record the operator, requested EPC, result, and timestamp without
   logging reader passwords, tunnel tokens, or other credentials.
 - Reader and Cloudflare credentials live below `/data/fcr-gate/secrets/` with mode
@@ -269,8 +271,9 @@ and reads the durable allocator row.
 - `503`: reader activity is stale/missing or SQLite cannot be read.
 
 The response deliberately excludes TID, EPC, user, vehicle, policy, and error text.
-Use a path-specific Cloudflare Access service-token policy for external monitoring,
-or query `http://127.0.0.1:8080/healthz` locally.
+The same listener exposes Prometheus-format direct-Loki delivery counters at
+`GET /metrics`. Use a path-specific Cloudflare Access service-token policy for
+external monitoring, or query the loopback endpoints locally.
 
 ## Loki event inspection
 
@@ -283,44 +286,41 @@ RSSI values remain JSON fields so they can be searched without creating
 high-cardinality Loki labels. Keep `RUST_LOG=info` in `gateway.env` to retain
 passage and successful-decision events; `warn` suppresses them.
 
-The release archive includes an optional Alloy configuration that reads only
-`fcr-rfid-encoder.service`. It labels the controlled `level`, `event`, `mode`, and
-`decision` fields, writes through a seven-day local WAL under `/data`, and sends
-batches to a Loki endpoint. Loki outages do not block the RFID event loop or UniFi
-decisions.
+Direct Loki delivery is optional and runs inside the Rust service. The formatter
+writes each complete JSON record to stderr first, so systemd retains it in
+journald, then uses a nonblocking send to copy the same record into a bounded
+in-memory queue. A background task sends batches of up to 100 records at least
+once per second with a five-second request timeout and capped exponential retry.
+A full queue drops only the remote copy; RFID reads, UniFi decisions, and the
+local journal continue normally. There is intentionally no disk-backed Loki
+queue because journald is the durable local fallback.
 
-After updating FCR Gate to a release containing the Alloy files, create its
-root-only environment file:
+Configure the existing root-only `gateway.env` file. Leave
+`FCR_GATE_LOKI_URL` empty to disable remote delivery:
 
-```bash
-install -m 0600 /data/fcr-gate/deploy/alloy.env.example \
-  /data/fcr-gate/secrets/alloy.env
-vi /data/fcr-gate/secrets/alloy.env
+```dotenv
+FCR_GATE_LOKI_URL=http://loki.tail1f002.ts.net:3100/loki/api/v1/push
+FCR_GATE_HOST=falls-creek-ranch-gate
+FCR_GATE_SITE=falls-creek-ranch
 ```
 
-Set `FCR_GATE_LOKI_URL` to the full Tailscale-reachable push URL, including
-`/loki/api/v1/push`. Then download and review the release installer:
+The URL must use HTTP or HTTPS, contain no embedded credentials, query, or
+fragment, and end with `/loki/api/v1/push`. The current homelab endpoint uses no
+authentication and is reachable only through the tailnet. An invalid Loki setting
+disables remote delivery and records `loki_config_invalid` in journald instead of
+preventing the gate service from starting. Restart the existing service after
+changing the environment file:
 
 ```bash
-curl --fail --location --proto '=https' --tlsv1.2 \
-  --output /tmp/install-fcr-gate-alloy.sh \
-  https://github.com/jpoehnelt/fcr-gate/releases/latest/download/install-fcr-gate-alloy.sh
-less /tmp/install-fcr-gate-alloy.sh
-bash /tmp/install-fcr-gate-alloy.sh
+systemctl restart fcr-rfid-encoder
+journalctl -u fcr-rfid-encoder -n 100 --no-pager
+curl --fail http://127.0.0.1:8080/metrics
 ```
 
-The installer downloads the pinned official Grafana Alloy standalone binary and
-verifies it against an independently pinned digest in the attested FCR Gate
-installer. It creates an unprivileged `alloy` service account, grants only the
-platform's journal-read groups, stores the binary under `/data/fcr-gate`, and
-installs a UniFi boot hook. The service has a read-only system view except for its
-persistent WAL directory. Verify delivery:
-
-```bash
-systemctl status alloy-fcr-gate --no-pager
-journalctl -u alloy-fcr-gate -n 100 --no-pager
-curl --fail http://127.0.0.1:12345/-/ready
-```
+`loki_delivery_failed` and `loki_delivery_recovered` records are written directly
+to journald to avoid feeding exporter failures back into the Loki queue. The
+Prometheus endpoint reports queue depth, enqueued, sent, and dropped events,
+request results, and the last successful push time.
 
 Useful LogQL queries:
 
@@ -329,16 +329,16 @@ Useful LogQL queries:
 ```
 
 ```logql
-{service_name="fcr-gate", event="lpr_correlation_match"} | json
+{service_name="fcr-gate"} | json | event="lpr_correlation_match"
 ```
 
 ```logql
-{service_name="fcr-gate", decision=~"denied|error"} | json
+{service_name="fcr-gate"} | json | decision=~"denied|error"
 ```
 
 SQLite remains the durable source of truth for assignments, evidence, and audit
-records. Loki is the searchable event timeline, while Prometheus remains the right
-place for health, rates, and alerts.
+records. Journald is the complete local service log, Loki is the searchable remote
+timeline, and Prometheus remains the right place for health, rates, and alerts.
 
 Impinj references:
 
@@ -358,20 +358,13 @@ Expected layout on a UniFi OS 4.x/5.x Cloud Gateway:
 /data/fcr-gate/
 ├── bin/
 │   ├── cloudflared
-│   ├── alloy
 │   ├── fcr-gate-admin
 │   └── fcr-rfid-encoder
 ├── deploy/
-│   ├── 40-alloy-fcr-gate.sh
-│   ├── alloy-fcr-gate.config.alloy
-│   ├── alloy-fcr-gate.service
-│   ├── alloy.env.example
 │   ├── cloudflared.service
 │   └── fcr-rfid-encoder.service
-├── alloy-data/
 ├── rfid-encoder.sqlite3
 └── secrets/
-    ├── alloy.env
     ├── cloudflare-tunnel-token
     ├── impinj-password
     ├── unifi-access-api-key
@@ -390,9 +383,8 @@ with the example environment and keep the password and environment files mode
 default that keeps writes off.
 
 Tagged GitHub releases automate installation and updates for the FCR Gate binaries
-and encoder service. The separate attested Alloy installer downloads and verifies
-Grafana's official binary after the Loki environment file is configured. Releases
-do not install or update `cloudflared`. See
+and encoder service, including direct Loki delivery when its URL is configured.
+Releases do not install or update `cloudflared`. See
 [Install on the UniFi gateway](../README.md#install-on-the-unifi-gateway) for the
 verified release workflow.
 

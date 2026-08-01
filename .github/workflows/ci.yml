@@ -97,27 +97,10 @@ jobs:
       - name: Lint shell scripts
         run: find . -type f -name '*.sh' -not -path './target/*' -print0 | xargs -0 shellcheck
 
-      - name: Validate Grafana Alloy configuration
-        env:
-          ALLOY_IMAGE: grafana/alloy:v1.18.0@sha256:491b0578c04983fd54fe99b587b6fab4404dc46d0dc16677bd6b00cc1140b308
-        run: |
-          docker run --rm \
-            --volume "$PWD/deploy:/work:ro" \
-            "$ALLOY_IMAGE" \
-            fmt --test /work/alloy-fcr-gate.config.alloy
-          docker run --rm \
-            --env FCR_GATE_LOKI_URL=http://100.64.0.10:3100/loki/api/v1/push \
-            --env FCR_GATE_HOST=falls-creek-gate \
-            --env FCR_GATE_SITE=falls-creek-ranch \
-            --volume "$PWD/deploy:/work:ro" \
-            "$ALLOY_IMAGE" \
-            validate /work/alloy-fcr-gate.config.alloy
-
       - name: Check shell syntax and installer interface
         run: |
           find . -type f -name '*.sh' -not -path './target/*' -print0 | xargs -0 -n1 bash -n
           bash install.sh --help >/dev/null
-          bash install-alloy.sh --help >/dev/null
 
       - name: Test calendar release helpers
         run: |

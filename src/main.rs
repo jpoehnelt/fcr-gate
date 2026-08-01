@@ -1,5 +1,3 @@
-mod logging;
-
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
@@ -12,6 +10,7 @@ use fcr_rfid_encoder::{
     config::{Config, GateMode, LprCorrelationMode, normalize_hex, state_db_path},
     engine::{Action, Engine},
     impinj::ImpinjClient,
+    logging,
     model::{DiscoveryObservation, ReaderEvent, TagObservation},
     plate::same_plate_family,
     store::{
@@ -98,10 +97,11 @@ const DISCOVERY_LPR_RETRY_BATCH: usize = 20;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    logging::init();
+    let logging = logging::init();
+    let loki_metrics = logging.metrics();
 
-    match Cli::parse().command.unwrap_or(Command::Run) {
-        Command::Run => run().await,
+    let result = match Cli::parse().command.unwrap_or(Command::Run) {
+        Command::Run => run(loki_metrics).await,
         Command::Status { limit } => status(limit),
         Command::GateEvents { limit } => gate_events(limit),
         Command::Retry { tid } => retry(&tid),
@@ -114,10 +114,12 @@ async fn main() -> Result<()> {
         } => associate_discovered(&tag_key, &unifi_user_id, apply).await,
         Command::RevokeLearned { tag_key } => revoke_learned(&tag_key),
         Command::ResetLearned { tag_key } => reset_learned(&tag_key),
-    }
+    };
+    logging.shutdown().await;
+    result
 }
 
-async fn run() -> Result<()> {
+async fn run(loki_metrics: std::sync::Arc<logging::LokiMetrics>) -> Result<()> {
     let config = Config::from_env()?;
     let mut store = Store::open(&config.state_db, config.actor.clone())?;
     let recovered = store.recover_interrupted()?;
@@ -141,7 +143,15 @@ async fn run() -> Result<()> {
     let (sender, mut receiver) = mpsc::channel::<ReaderEvent>(4096);
     let stream_task = tokio::spawn(reader.clone().stream_events(sender));
     let web_handle = if config.web_enabled || config.health_enabled {
-        Some(web::start(&config, unifi.clone(), reader_health).await?)
+        Some(
+            web::start(
+                &config,
+                unifi.clone(),
+                reader_health,
+                std::sync::Arc::clone(&loki_metrics),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -174,6 +184,7 @@ async fn run() -> Result<()> {
         confirm_reads = config.confirm_reads,
         operator_ui = config.web_enabled,
         health_endpoint = config.health_enabled,
+        loki_delivery = loki_metrics.enabled(),
         lpr_correlation_mode = config.lpr_correlation_mode.as_str(),
         discovery_mode = config.discovery_mode.as_str(),
         gate_mode = config.gate_mode.as_str(),

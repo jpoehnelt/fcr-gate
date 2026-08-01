@@ -39,11 +39,7 @@ esac
 
 expected_members=(
   30-fcr-rfid-encoder.sh
-  40-alloy-fcr-gate.sh
   VERSION
-  alloy-fcr-gate.config.alloy
-  alloy-fcr-gate.service
-  alloy.env.example
   fcr-gate-admin
   fcr-rfid-encoder
   fcr-rfid-encoder.service
