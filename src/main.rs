@@ -10,6 +10,7 @@ use fcr_rfid_encoder::{
     config::{Config, GateMode, LprCorrelationMode, normalize_hex, state_db_path},
     engine::{Action, Engine},
     impinj::ImpinjClient,
+    logging,
     model::{DiscoveryObservation, ReaderEvent, TagObservation},
     plate::same_plate_family,
     store::{
@@ -21,7 +22,6 @@ use fcr_rfid_encoder::{
 };
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(about, version)]
@@ -97,15 +97,11 @@ const DISCOVERY_LPR_RETRY_BATCH: usize = 20;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+    let logging = logging::init();
+    let loki_metrics = logging.metrics();
 
-    match Cli::parse().command.unwrap_or(Command::Run) {
-        Command::Run => run().await,
+    let result = match Cli::parse().command.unwrap_or(Command::Run) {
+        Command::Run => run(loki_metrics).await,
         Command::Status { limit } => status(limit),
         Command::GateEvents { limit } => gate_events(limit),
         Command::Retry { tid } => retry(&tid),
@@ -118,15 +114,20 @@ async fn main() -> Result<()> {
         } => associate_discovered(&tag_key, &unifi_user_id, apply).await,
         Command::RevokeLearned { tag_key } => revoke_learned(&tag_key),
         Command::ResetLearned { tag_key } => reset_learned(&tag_key),
-    }
+    };
+    logging.shutdown().await;
+    result
 }
 
-async fn run() -> Result<()> {
+async fn run(loki_metrics: std::sync::Arc<logging::LokiMetrics>) -> Result<()> {
     let config = Config::from_env()?;
     let mut store = Store::open(&config.state_db, config.actor.clone())?;
     let recovered = store.recover_interrupted()?;
     if recovered > 0 {
-        warn!(recovered, "recovered interrupted encoding assignments");
+        warn!(
+            event = "encoding_assignments_recovered",
+            recovered, "recovered interrupted encoding assignments"
+        );
     }
 
     let reader = ImpinjClient::new(&config)?;
@@ -142,7 +143,15 @@ async fn run() -> Result<()> {
     let (sender, mut receiver) = mpsc::channel::<ReaderEvent>(4096);
     let stream_task = tokio::spawn(reader.clone().stream_events(sender));
     let web_handle = if config.web_enabled || config.health_enabled {
-        Some(web::start(&config, unifi.clone(), reader_health).await?)
+        Some(
+            web::start(
+                &config,
+                unifi.clone(),
+                reader_health,
+                std::sync::Arc::clone(&loki_metrics),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -168,12 +177,14 @@ async fn run() -> Result<()> {
     tokio::pin!(shutdown);
 
     info!(
+        event = "service_ready",
         writes_enabled = config.writes_enabled,
         antenna = config.antenna_port,
         min_rssi_dbm = config.min_rssi_cdbm as f64 / 100.0,
         confirm_reads = config.confirm_reads,
         operator_ui = config.web_enabled,
         health_endpoint = config.health_enabled,
+        loki_delivery = loki_metrics.enabled(),
         lpr_correlation_mode = config.lpr_correlation_mode.as_str(),
         discovery_mode = config.discovery_mode.as_str(),
         gate_mode = config.gate_mode.as_str(),
@@ -181,6 +192,7 @@ async fn run() -> Result<()> {
     );
     if !config.writes_enabled {
         warn!(
+            event = "rfid_writes_disabled",
             "RFID writes are disabled; candidates will be observed but never allocated or modified"
         );
     }
@@ -189,10 +201,10 @@ async fn run() -> Result<()> {
         tokio::select! {
             result = &mut shutdown => {
                 result?;
-                info!("shutdown requested");
+                info!(event = "service_shutdown_requested", "shutdown requested");
                 stream_task.abort();
                 if let Err(error) = reader.stop_profile(&config.profile_id).await {
-                    warn!(%error, "could not stop the owned reader profile during shutdown");
+                    warn!(event = "reader_profile_stop_failed", %error, "could not stop the owned reader profile during shutdown");
                 }
                 if let Some(web_handle) = web_handle {
                     web_handle.shutdown().await;
@@ -208,7 +220,7 @@ async fn run() -> Result<()> {
                         config.retry_cooldown,
                         config.max_attempts,
                     )?;
-                    warn!(%tid, "encoding transaction timed out and was released for retry");
+                    warn!(event = "encoding_transaction_timed_out", %tid, "encoding transaction timed out and was released for retry");
                 }
                 if config.discovery_mode.enabled() {
                     match tokio::time::timeout(
@@ -219,10 +231,10 @@ async fn run() -> Result<()> {
                     {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
-                            error!(%error, "failed to retry pending RFID/LPR discovery passages");
+                            error!(event = "discovery_retry_failed", %error, "failed to retry pending RFID/LPR discovery passages");
                         }
                         Err(_) => {
-                            warn!("paused delayed RFID/LPR retries to keep the reader loop responsive");
+                            warn!(event = "discovery_retry_paused", "paused delayed RFID/LPR retries to keep the reader loop responsive");
                         }
                     }
                 }
@@ -241,7 +253,7 @@ async fn run() -> Result<()> {
                     &mut gate,
                     event,
                 ).await {
-                    error!(%error, "failed to process reader event");
+                    error!(event = "reader_event_processing_failed", %error, "failed to process reader event");
                 }
             }
         }
@@ -318,6 +330,8 @@ async fn handle_event(
             if !config.writes_enabled {
                 if dry_run_reported.insert(tid.clone()) {
                     info!(
+                        event = "encoding_candidate_ready",
+                        mode = "dry-run",
                         %tid,
                         rssi_dbm = observation.peak_rssi_cdbm as f64 / 100.0,
                         "dry-run candidate satisfied all encoding gates"
@@ -350,6 +364,7 @@ async fn handle_event(
                     store.mark_queued(&encoding.tid)?;
                     engine.set_in_flight(encoding.tid.clone(), Instant::now());
                     info!(
+                        event = "epc_write_queued",
                         tid = %encoding.tid,
                         epc = %encoding.assigned_epc,
                         attempt = encoding.attempts + 1,
@@ -369,24 +384,24 @@ async fn handle_event(
         }
         Action::AccessVerified { tid, epc } => {
             store.mark_verified(&tid, &epc)?;
-            info!(%tid, %epc, "all EPC words and read-back verified; awaiting inventory confirmation");
+            info!(event = "epc_write_verified", %tid, %epc, "all EPC words and read-back verified; awaiting inventory confirmation");
         }
         Action::AccessFailed { tid, reason } => {
             store.mark_access_failed(&tid, &reason, config.retry_cooldown, config.max_attempts)?;
             engine.clear_in_flight(&tid);
-            warn!(%tid, %reason, "EPC write transaction failed");
+            warn!(event = "epc_write_failed", %tid, %reason, "EPC write transaction failed");
         }
         Action::Completed { tid, epc } => {
             store.mark_completed(&tid, &epc)?;
             store.record_seen(&tid, &epc, observation.peak_rssi_cdbm)?;
             engine.clear_in_flight(&tid);
-            info!(%tid, %epc, "encoding completed and confirmed by normal inventory");
+            info!(event = "encoding_completed", %tid, %epc, "encoding completed and confirmed by normal inventory");
             maybe_correlate_lpr(config, gate, store, &observation).await?;
         }
         Action::Conflict { tid, observed_epc } => {
             store.mark_conflict(&tid, &observed_epc)?;
             engine.clear_in_flight(&tid);
-            error!(%tid, %observed_epc, "TID reported an EPC different from its durable assignment");
+            error!(event = "epc_assignment_conflict", %tid, %observed_epc, "TID reported an EPC different from its durable assignment");
         }
     }
     Ok(())
@@ -420,17 +435,33 @@ async fn maybe_learn_discovered_tag(
         config.discovery_max_dwell,
         config.discovery_evidence_retention,
     )?;
+    if seen.new_passage {
+        info!(
+            event = "rfid_passage_started",
+            passage_id = seen.passage_id,
+            tag = %observation.tag_key,
+            identity_kind = observation.identity_kind,
+            tid = observation.tid.as_deref().unwrap_or(""),
+            epc = %observation.epc,
+            antenna = observation.antenna_port,
+            rssi_dbm = observation.peak_rssi_cdbm as f64 / 100.0,
+            "observed a new RFID passage"
+        );
+    }
     if seen.became_long_dwell {
         let reason = "tag remained continuously readable beyond the discovery dwell limit";
         if config.discovery_mode == LprCorrelationMode::Live
             && store.suspend_discovered_tag(&observation.tag_key, reason)?
         {
             warn!(
+                event = "discovered_tag_suspended_stationary",
                 tag = %observation.tag_key,
                 "suspended learned tag because it appears stationary near the reader"
             );
         } else if config.discovery_mode == LprCorrelationMode::DryRun {
             warn!(
+                event = "discovered_tag_stationary",
+                mode = "dry-run",
                 tag = %observation.tag_key,
                 "dry run: stationary-tag evidence would suspend an active learned tag"
             );
@@ -499,6 +530,7 @@ async fn match_discovery_passage(
             let invalidated_match = seen.correlation_status == "matched";
             if store.mark_discovery_passage_ambiguous(seen.passage_id)? {
                 warn!(
+                    event = "discovery_passage_ambiguous",
                     tag = %observation.tag_key,
                     %reason,
                     "discarded ambiguous multi-visit discovery passage"
@@ -512,6 +544,7 @@ async fn match_discovery_passage(
                 )?
             {
                 warn!(
+                    event = "discovered_tag_suspended_ambiguous",
                     tag = %observation.tag_key,
                     "suspended learned tag after a previously matched passage became ambiguous"
                 );
@@ -537,11 +570,14 @@ async fn match_discovery_passage(
                 )?
             {
                 warn!(
+                    event = "discovered_tag_suspended_multiple_vehicles",
                     tag = %observation.tag_key,
                     "suspended learned tag after one passage matched multiple vehicles"
                 );
             } else if config.discovery_mode == LprCorrelationMode::DryRun {
                 warn!(
+                    event = "discovery_passage_multiple_vehicles",
+                    mode = "dry-run",
                     tag = %observation.tag_key,
                     "dry run: ambiguous passage would suspend an active learned tag"
                 );
@@ -587,6 +623,7 @@ async fn match_discovery_passage(
             )?
         {
             warn!(
+                event = "discovered_tag_suspended_conflict",
                 tag = %observation.tag_key,
                 conflicts,
                 original_plate = %assignment.plate,
@@ -597,6 +634,8 @@ async fn match_discovery_passage(
             && conflicts >= config.discovery_conflict_occurrences
         {
             warn!(
+                event = "discovered_tag_conflict",
+                mode = "dry-run",
                 tag = %observation.tag_key,
                 conflicts,
                 original_plate = %assignment.plate,
@@ -631,6 +670,7 @@ async fn match_discovery_passage(
     if candidate.lpr_actor_type == "visitor" {
         if store.record_discovery_candidate_audit(&candidate)? {
             info!(
+                event = "discovery_candidate_needs_resident",
                 tag = %candidate.tag_key,
                 epc = %candidate.epc,
                 plate = %candidate.plate,
@@ -653,8 +693,10 @@ async fn match_discovery_passage(
         Ok(user) => user,
         Err(error) => {
             warn!(
+                event = "discovery_user_validation_failed",
                 tag = %candidate.tag_key,
                 plate = %candidate.plate,
+                user_id = %candidate.lpr_actor_id,
                 %error,
                 "learned RFID candidate did not pass current UniFi user validation"
             );
@@ -664,9 +706,12 @@ async fn match_discovery_passage(
     if config.discovery_mode == LprCorrelationMode::DryRun {
         if store.record_discovery_candidate_audit(&candidate)? {
             info!(
+                event = "discovery_candidate_ready",
+                mode = "dry-run",
                 tag = %candidate.tag_key,
                 epc = %candidate.epc,
                 plate = %candidate.plate,
+                user_id = %user.id,
                 user = %user.display_name(),
                 occurrences = candidate.matched_occurrences,
                 days = candidate.distinct_days,
@@ -686,9 +731,11 @@ async fn match_discovery_passage(
     gate.last_attempts
         .insert(observation.tag_key.clone(), Instant::now());
     info!(
+        event = "discovered_tag_activated",
         tag = %candidate.tag_key,
         epc = %candidate.epc,
         plate = %candidate.plate,
+        user_id = %user.id,
         user = %user.display_name(),
         occurrences = candidate.matched_occurrences,
         days = candidate.distinct_days,
@@ -741,6 +788,7 @@ async fn retry_pending_discovery_matches(
         let observation = pending_discovery_observation(config, &passage);
         let seen = DiscoverySeen {
             passage_id: passage.passage_id,
+            new_passage: false,
             started_at_ms: passage.started_at_ms,
             last_seen_ms: passage.last_seen_ms,
             correlation_status: "pending".into(),
@@ -750,6 +798,7 @@ async fn retry_pending_discovery_matches(
         if let Err(error) = match_discovery_passage(config, gate, store, &observation, &seen).await
         {
             warn!(
+                event = "discovery_passage_retry_failed",
                 passage_id = passage.passage_id,
                 tag = %passage.tag_key,
                 attempt = attempts,
@@ -813,6 +862,7 @@ async fn maybe_correlate_lpr(
                 store.advance_lpr_correlation_not_before(tid, now_ms)?;
             }
             warn!(
+                event = "lpr_correlation_multiple_tags",
                 tid = %observation.tid,
                 tag_count = recent_tids.len(),
                 "LPR correlation deferred because multiple unassigned RFID tags are present; a new plate event will be required"
@@ -848,7 +898,9 @@ async fn maybe_correlate_lpr(
                 &detail,
             )?;
             warn!(
+                event = "lpr_correlation_ambiguous",
                 tid = %observation.tid,
+                epc = %observation.epc,
                 %reason,
                 "LPR correlation was ambiguous; a new plate event will be required"
             );
@@ -870,6 +922,8 @@ async fn maybe_correlate_lpr(
                     &detail,
                 )?;
                 info!(
+                    event = "lpr_correlation_needs_resident",
+                    direction = "entry",
                     tid = %observation.tid,
                     plate = %candidate.plate,
                     visitor_id = %candidate.actor_id,
@@ -894,7 +948,9 @@ async fn maybe_correlate_lpr(
                         &detail,
                     )?;
                     warn!(
+                        event = "lpr_correlation_user_validation_failed",
                         tid = %observation.tid,
+                        user_id = %candidate.actor_id,
                         %error,
                         "LPR user failed the ownership eligibility check; a new plate event will be required"
                     );
@@ -917,8 +973,13 @@ async fn maybe_correlate_lpr(
                 )?;
                 store.advance_lpr_correlation_not_before(&observation.tid, now_ms)?;
                 info!(
+                    event = "lpr_correlation_match",
+                    mode = "dry-run",
+                    decision = "would-assign",
+                    direction = "entry",
                     tid = %observation.tid,
                     plate = %candidate.plate,
+                    user_id = %user.id,
                     user = %user.display_name(),
                     "dry run: LPR event would assign RFID tag to existing UniFi user"
                 );
@@ -938,8 +999,13 @@ async fn maybe_correlate_lpr(
             gate.last_attempts
                 .insert(observation.tid.clone(), Instant::now());
             info!(
+                event = "lpr_correlation_match",
+                mode = "live",
+                decision = "assigned",
+                direction = "entry",
                 tid = %observation.tid,
                 plate = %candidate.plate,
+                user_id = %user.id,
                 user = %user.display_name(),
                 "assigned RFID tag to the existing UniFi user matched by Entry Gate LPR"
             );
@@ -987,8 +1053,12 @@ async fn maybe_unlock_gate_identity(
                     Some(&policy_name),
                 )?;
                 info!(
+                    event = "gate_authorization",
+                    mode = "dry-run",
+                    decision = "granted",
                     tag = %tag_key,
                     %epc,
+                    user_id = %user.id,
                     user = %user.display_name(),
                     policy = %policy_name,
                     "dry run: assigned RFID tag would unlock the Entry Gate"
@@ -1009,8 +1079,12 @@ async fn maybe_unlock_gate_identity(
                         Some(&policy_name),
                     )?;
                     info!(
+                        event = "gate_authorization",
+                        mode = "live",
+                        decision = "granted",
                         tag = %tag_key,
                         %epc,
+                        user_id = %user.id,
                         user = %user.display_name(),
                         policy = %policy_name,
                         "authorized RFID tag unlocked the Entry Gate"
@@ -1025,6 +1099,16 @@ async fn maybe_unlock_gate_identity(
                         "error",
                         Some(&error.to_string()),
                     )?;
+                    error!(
+                        event = "gate_authorization",
+                        mode = "live",
+                        decision = "error",
+                        tag = %tag_key,
+                        %epc,
+                        user_id = %user.id,
+                        %error,
+                        "authorized RFID unlock command failed"
+                    );
                     return Err(error.context("authorized RFID unlock command failed"));
                 }
             }
@@ -1039,10 +1123,13 @@ async fn maybe_unlock_gate_identity(
                 Some(&reason),
             )?;
             warn!(
+                event = "gate_authorization",
+                decision = "denied",
                 tag = %tag_key,
                 %epc,
+                user_id = %owner.unifi_user_id,
                 %reason,
-                gate_mode = config.gate_mode.as_str(),
+                mode = config.gate_mode.as_str(),
                 "assigned RFID tag denied by current UniFi user policy"
             );
         }
@@ -1055,6 +1142,16 @@ async fn maybe_unlock_gate_identity(
                 "error",
                 Some(&error.to_string()),
             )?;
+            error!(
+                event = "gate_authorization",
+                decision = "error",
+                tag = %tag_key,
+                %epc,
+                user_id = %owner.unifi_user_id,
+                %error,
+                mode = config.gate_mode.as_str(),
+                "could not verify current UniFi access; gate remains locked"
+            );
             return Err(error.context("could not verify current UniFi access; gate remains locked"));
         }
     }

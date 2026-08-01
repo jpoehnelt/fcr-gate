@@ -19,6 +19,8 @@ flowchart LR
     E <-->|"IoT Device Interface"| R["Impinj R700"]
     E -->|"current user + policy + schedule"| UA["UniFi Access API"]
     UA -->|"attributed remote unlock"| G["Entry Gate"]
+    E -->|"complete local JSON log"| J["journald"]
+    E -.->|"best-effort JSON batches"| L["Loki over Tailscale"]
 ```
 
 ## Safety boundary
@@ -29,8 +31,8 @@ flowchart LR
   Cloudflare Access policy determines which identities are allowed.
 - RFID writes default to disabled and require an explicit server-side setting.
 - UniFi gate unlocks use a separate setting and also default to disabled.
-- `/healthz` contains no tag or user data, binds to loopback with the UI, and should
-  use a Cloudflare Access service token for external monitoring.
+- `/healthz` and `/metrics` contain no tag or user data, bind to loopback with the
+  UI, and should use a Cloudflare Access service token for external monitoring.
 - Every write must record the operator, requested EPC, result, and timestamp without
   logging reader passwords, tunnel tokens, or other credentials.
 - Reader and Cloudflare credentials live below `/data/fcr-gate/secrets/` with mode
@@ -269,8 +271,74 @@ and reads the durable allocator row.
 - `503`: reader activity is stale/missing or SQLite cannot be read.
 
 The response deliberately excludes TID, EPC, user, vehicle, policy, and error text.
-Use a path-specific Cloudflare Access service-token policy for external monitoring,
-or query `http://127.0.0.1:8080/healthz` locally.
+The same listener exposes Prometheus-format direct-Loki delivery counters at
+`GET /metrics`. Use a path-specific Cloudflare Access service-token policy for
+external monitoring, or query the loopback endpoints locally.
+
+## Loki event inspection
+
+The encoder writes newline-delimited JSON to stderr, which systemd stores in the
+journal. Operational events use stable names such as `service_ready`,
+`reader_stream_disconnected`, `rfid_passage_started`, `lpr_correlation_match`, and
+`gate_authorization`. One `rfid_passage_started` record is emitted per passage,
+rather than one record per reader report. TIDs, EPCs, plates, user IDs, errors, and
+RSSI values remain JSON fields so they can be searched without creating
+high-cardinality Loki labels. Keep `RUST_LOG=info` in `gateway.env` to retain
+passage and successful-decision events; `warn` suppresses them.
+
+Direct Loki delivery is optional and runs inside the Rust service. The formatter
+writes each complete JSON record to stderr first, so systemd retains it in
+journald, then uses a nonblocking send to copy the same record into a bounded
+in-memory queue. A background task sends batches of up to 100 records at least
+once per second with a five-second request timeout and capped exponential retry.
+A full queue drops only the remote copy; RFID reads, UniFi decisions, and the
+local journal continue normally. There is intentionally no disk-backed Loki
+queue because journald is the durable local fallback.
+
+Configure the existing root-only `gateway.env` file. Leave
+`FCR_GATE_LOKI_URL` empty to disable remote delivery:
+
+```dotenv
+FCR_GATE_LOKI_URL=http://loki.tail1f002.ts.net:3100/loki/api/v1/push
+FCR_GATE_HOST=falls-creek-ranch-gate
+FCR_GATE_SITE=falls-creek-ranch
+```
+
+The URL must use HTTP or HTTPS, contain no embedded credentials, query, or
+fragment, and end with `/loki/api/v1/push`. The current homelab endpoint uses no
+authentication and is reachable only through the tailnet. An invalid Loki setting
+disables remote delivery and records `loki_config_invalid` in journald instead of
+preventing the gate service from starting. Restart the existing service after
+changing the environment file:
+
+```bash
+systemctl restart fcr-rfid-encoder
+journalctl -u fcr-rfid-encoder -n 100 --no-pager
+curl --fail http://127.0.0.1:8080/metrics
+```
+
+`loki_delivery_failed` and `loki_delivery_recovered` records are written directly
+to journald to avoid feeding exporter failures back into the Loki queue. The
+Prometheus endpoint reports queue depth, enqueued, sent, and dropped events,
+request results, and the last successful push time.
+
+Useful LogQL queries:
+
+```logql
+{service_name="fcr-gate"} | json | tid="E2801234"
+```
+
+```logql
+{service_name="fcr-gate"} | json | event="lpr_correlation_match"
+```
+
+```logql
+{service_name="fcr-gate"} | json | decision=~"denied|error"
+```
+
+SQLite remains the durable source of truth for assignments, evidence, and audit
+records. Journald is the complete local service log, Loki is the searchable remote
+timeline, and Prometheus remains the right place for health, rates, and alerts.
 
 Impinj references:
 
@@ -315,7 +383,8 @@ with the example environment and keep the password and environment files mode
 default that keeps writes off.
 
 Tagged GitHub releases automate installation and updates for the FCR Gate binaries
-and encoder service. They do not install or update `cloudflared`. See
+and encoder service, including direct Loki delivery when its URL is configured.
+Releases do not install or update `cloudflared`. See
 [Install on the UniFi gateway](../README.md#install-on-the-unifi-gateway) for the
 verified release workflow.
 

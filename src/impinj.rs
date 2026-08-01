@@ -146,7 +146,7 @@ impl ImpinjClient {
                 if active.profile == "inventory"
                     && active.id.as_deref() == Some(config.profile_id.as_str())
                 {
-                    info!(profile = %config.profile_id, "reusing active reader profile");
+                    info!(event = "reader_profile_reused", profile = %config.profile_id, "reusing active reader profile");
                     return Ok(());
                 }
                 bail!(
@@ -194,7 +194,7 @@ impl ImpinjClient {
             .await
             .context("failed to start reader profile")?;
         expect(response, &[StatusCode::NO_CONTENT], "start profile").await?;
-        info!(profile = %config.profile_id, "reader inventory profile started");
+        info!(event = "reader_profile_started", profile = %config.profile_id, "reader inventory profile started");
         Ok(())
     }
 
@@ -209,7 +209,11 @@ impl ImpinjClient {
             .await
             .context("failed to stop reader profile")?;
         expect(response, &[StatusCode::NO_CONTENT], "stop profile").await?;
-        info!(profile = profile_id, "reader inventory profile stopped");
+        info!(
+            event = "reader_profile_stopped",
+            profile = profile_id,
+            "reader inventory profile stopped"
+        );
         Ok(())
     }
 
@@ -244,7 +248,7 @@ impl ImpinjClient {
                 }
                 Err(error) => {
                     self.health.mark_disconnected();
-                    warn!(%error, retry_seconds = backoff.as_secs(), "reader event stream disconnected");
+                    warn!(event = "reader_stream_disconnected", %error, retry_seconds = backoff.as_secs(), "reader event stream disconnected");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
@@ -260,7 +264,10 @@ impl ImpinjClient {
             .context("failed to connect to reader event stream")?
             .error_for_status()
             .context("reader event stream request failed")?;
-        info!("connected to reader event stream");
+        info!(
+            event = "reader_stream_connected",
+            "connected to reader event stream"
+        );
         self.health.mark_connected();
         let mut bytes = response.bytes_stream();
         let mut buffer = Vec::with_capacity(8192);
@@ -291,7 +298,9 @@ impl ImpinjClient {
                             return Ok(());
                         }
                     }
-                    Err(error) => warn!(%error, "discarding malformed reader event"),
+                    Err(error) => {
+                        warn!(event = "reader_event_malformed", %error, "discarding malformed reader event")
+                    }
                 }
             }
         }

@@ -19,6 +19,7 @@ use tracing::{error, info};
 use crate::{
     config::{Config, normalize_hex},
     impinj::ReaderHealth,
+    logging::LokiMetrics,
     store::{Store, TagOwner, TagRecord, now_ms},
     unifi::{UnifiClient, UnifiUser},
 };
@@ -33,6 +34,7 @@ struct AppState {
     reader_health: ReaderHealth,
     health_stale_after: Duration,
     started_at: Instant,
+    loki_metrics: Arc<LokiMetrics>,
 }
 
 pub struct WebHandle {
@@ -124,7 +126,7 @@ impl ApiError {
     }
 
     fn internal(error: anyhow::Error) -> Self {
-        error!(%error, "operator UI request failed");
+        error!(event = "operator_request_failed", %error, "operator UI request failed");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "internal service error".into(),
@@ -148,6 +150,7 @@ pub async fn start(
     config: &Config,
     unifi: Option<UnifiClient>,
     reader_health: ReaderHealth,
+    loki_metrics: Arc<LokiMetrics>,
 ) -> Result<WebHandle> {
     let listener = TcpListener::bind(config.web_bind)
         .await
@@ -159,10 +162,13 @@ pub async fn start(
         reader_health,
         health_stale_after: config.health_stale_after,
         started_at: Instant::now(),
+        loki_metrics,
     };
     let mut router = Router::new();
     if config.health_enabled {
-        router = router.route("/healthz", get(health));
+        router = router
+            .route("/healthz", get(health))
+            .route("/metrics", get(metrics));
     }
     if config.web_enabled {
         router = router
@@ -183,10 +189,10 @@ pub async fn start(
             let _ = shutdown_receiver.await;
         });
         if let Err(error) = server.await {
-            error!(%error, "operator UI stopped unexpectedly");
+            error!(event = "operator_service_stopped", %error, "operator UI stopped unexpectedly");
         }
     });
-    info!(%address, "gateway HTTP service listening on loopback");
+    info!(event = "operator_service_listening", %address, "gateway HTTP service listening on loopback");
     Ok(WebHandle {
         shutdown: Some(shutdown_sender),
         task,
@@ -206,14 +212,15 @@ async fn health(State(state): State<AppState>) -> Response {
     } else {
         "stale"
     };
-    let database_ok =
-        match Store::open(&state.db_path, "health").and_then(|store| store.health_check()) {
-            Ok(()) => true,
-            Err(error) => {
-                error!(%error, "health check could not access RFID state database");
-                false
-            }
-        };
+    let database_ok = match Store::open(&state.db_path, "health")
+        .and_then(|store| store.health_check())
+    {
+        Ok(()) => true,
+        Err(error) => {
+            error!(event = "health_database_check_failed", %error, "health check could not access RFID state database");
+            false
+        }
+    };
     let healthy = reader_recent && database_ok;
     let body = HealthResponse {
         status: if healthy { "ok" } else { "unhealthy" },
@@ -232,6 +239,18 @@ async fn health(State(state): State<AppState>) -> Response {
         Json(body),
     )
         .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn metrics(State(state): State<AppState>) -> Response {
+    let mut response = state.loki_metrics.render_prometheus().into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -478,6 +497,7 @@ mod tests {
             reader_health: ReaderHealth::default(),
             health_stale_after: Duration::from_secs(120),
             started_at: Instant::now(),
+            loki_metrics: Arc::new(LokiMetrics::default()),
         }
     }
 
@@ -648,5 +668,24 @@ mod tests {
             health(State(bad_database)).await.status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exposes_only_delivery_counters() {
+        let response = metrics(State(state())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("fcr_gate_loki_events_dropped_total"));
+        assert!(!body.contains("tid"));
+        assert!(!body.contains("plate"));
+        assert!(!body.contains("user"));
     }
 }
