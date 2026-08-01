@@ -23,6 +23,7 @@ use tracing_subscriber::fmt::MakeWriter;
 const LOKI_PUSH_PATH: &str = "/loki/api/v1/push";
 const LOKI_QUEUE_CAPACITY: usize = 4096;
 const LOKI_BATCH_SIZE: usize = 100;
+const LOKI_MAX_RETAINED_EVENTS: usize = LOKI_BATCH_SIZE * 10;
 const LOKI_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const LOKI_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LOKI_MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -63,7 +64,7 @@ impl LokiMetrics {
                 "# TYPE fcr_gate_loki_requests_total counter\n",
                 "fcr_gate_loki_requests_total{{result=\"success\"}} {}\n",
                 "fcr_gate_loki_requests_total{{result=\"failure\"}} {}\n",
-                "# HELP fcr_gate_loki_queue_depth Events currently waiting in the bounded Loki queue.\n",
+                "# HELP fcr_gate_loki_queue_depth Accepted events awaiting a final Loki delivery outcome.\n",
                 "# TYPE fcr_gate_loki_queue_depth gauge\n",
                 "fcr_gate_loki_queue_depth {}\n",
                 "# HELP fcr_gate_loki_last_success_timestamp_seconds Unix timestamp of the most recent successful Loki push.\n",
@@ -328,26 +329,35 @@ async fn loki_worker(
     loop {
         let should_flush = tokio::select! {
             _ = &mut shutdown => {
-                while batch.len() < LOKI_BATCH_SIZE {
-                    let Ok(line) = receiver.try_recv() else { break; };
-                    metrics.queue_depth.fetch_sub(1, Ordering::Relaxed);
-                    batch.push(LokiRecord {
-                        timestamp_ns: next_timestamp_ns(&clock).to_string(),
-                        line,
-                    });
-                }
-                if !batch.is_empty() {
-                    record_push_result(push_batch(&client, &config, &batch).await, &batch, &metrics);
-                }
+                finish_loki_worker(
+                    &client,
+                    &config,
+                    &mut receiver,
+                    &mut batch,
+                    &clock,
+                    &metrics,
+                ).await;
                 return;
             }
             line = receiver.recv() => {
-                let Some(line) = line else { return; };
-                metrics.queue_depth.fetch_sub(1, Ordering::Relaxed);
-                batch.push(LokiRecord {
-                    timestamp_ns: next_timestamp_ns(&clock).to_string(),
+                let Some(line) = line else {
+                    finish_loki_worker(
+                        &client,
+                        &config,
+                        &mut receiver,
+                        &mut batch,
+                        &clock,
+                        &metrics,
+                    ).await;
+                    return;
+                };
+                retain_record(
+                    &mut batch,
                     line,
-                });
+                    LOKI_MAX_RETAINED_EVENTS,
+                    &clock,
+                    &metrics,
+                );
                 batch.len() >= LOKI_BATCH_SIZE
             }
             _ = flush.tick(), if !batch.is_empty() => true,
@@ -356,19 +366,10 @@ async fn loki_worker(
         if !should_flush {
             continue;
         }
-        match push_batch(&client, &config, &batch).await {
+        let result = push_batch(&client, &config, &batch).await;
+        record_push_attempt(&result, batch.len(), &metrics, false);
+        match result {
             Ok(()) => {
-                metrics.requests_succeeded.fetch_add(1, Ordering::Relaxed);
-                metrics
-                    .events_sent
-                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
-                metrics.last_success_timestamp_seconds.store(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                    Ordering::Relaxed,
-                );
                 batch.clear();
                 backoff = Duration::from_secs(1);
                 if delivery_failed {
@@ -382,7 +383,6 @@ async fn loki_worker(
                 }
             }
             Err(error) => {
-                metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
                 if !delivery_failed {
                     internal_event(
                         "WARN",
@@ -393,12 +393,58 @@ async fn loki_worker(
                     delivery_failed = true;
                 }
                 tokio::select! {
-                    _ = &mut shutdown => return,
+                    _ = &mut shutdown => {
+                        finish_loki_worker(
+                            &client,
+                            &config,
+                            &mut receiver,
+                            &mut batch,
+                            &clock,
+                            &metrics,
+                        ).await;
+                        return;
+                    },
                     _ = tokio::time::sleep(backoff) => {}
                 }
                 backoff = (backoff * 2).min(LOKI_MAX_BACKOFF);
             }
         }
+    }
+}
+
+fn retain_record(
+    batch: &mut Vec<LokiRecord>,
+    line: String,
+    limit: usize,
+    clock: &AtomicU64,
+    metrics: &LokiMetrics,
+) {
+    if batch.len() < limit {
+        batch.push(LokiRecord {
+            timestamp_ns: next_timestamp_ns(clock).to_string(),
+            line,
+        });
+    } else {
+        metrics.events_dropped.fetch_add(1, Ordering::Relaxed);
+        metrics.queue_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn finish_loki_worker(
+    client: &Client,
+    config: &LokiConfig,
+    receiver: &mut mpsc::Receiver<String>,
+    batch: &mut Vec<LokiRecord>,
+    clock: &AtomicU64,
+    metrics: &LokiMetrics,
+) {
+    let final_batch_limit = batch.len().max(LOKI_BATCH_SIZE);
+    while let Ok(line) = receiver.try_recv() {
+        retain_record(batch, line, final_batch_limit, clock, metrics);
+    }
+    if !batch.is_empty() {
+        let result = push_batch(client, config, batch).await;
+        record_push_attempt(&result, batch.len(), metrics, true);
     }
 }
 
@@ -428,13 +474,21 @@ async fn push_batch(client: &Client, config: &LokiConfig, batch: &[LokiRecord]) 
     Ok(())
 }
 
-fn record_push_result(result: Result<()>, batch: &[LokiRecord], metrics: &LokiMetrics) {
+fn record_push_attempt(
+    result: &Result<()>,
+    event_count: usize,
+    metrics: &LokiMetrics,
+    discard_on_failure: bool,
+) {
     match result {
         Ok(()) => {
             metrics.requests_succeeded.fetch_add(1, Ordering::Relaxed);
             metrics
                 .events_sent
-                .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                .fetch_add(event_count as u64, Ordering::Relaxed);
+            metrics
+                .queue_depth
+                .fetch_sub(event_count as u64, Ordering::Relaxed);
             metrics.last_success_timestamp_seconds.store(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -445,9 +499,14 @@ fn record_push_result(result: Result<()>, batch: &[LokiRecord], metrics: &LokiMe
         }
         Err(_) => {
             metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
-            metrics
-                .events_dropped
-                .fetch_add(batch.len() as u64, Ordering::Relaxed);
+            if discard_on_failure {
+                metrics
+                    .events_dropped
+                    .fetch_add(event_count as u64, Ordering::Relaxed);
+                metrics
+                    .queue_depth
+                    .fetch_sub(event_count as u64, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -511,9 +570,9 @@ fn internal_event(level: &str, event: &str, message: &str, error: Option<&str>) 
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use axum::{Json, Router, extract::State, routing::post};
+    use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
     use serde_json::Value;
-    use tokio::net::TcpListener;
+    use tokio::{net::TcpListener, sync::Notify};
     use tracing::info;
 
     use super::*;
@@ -527,6 +586,12 @@ mod tests {
     struct FailingWriter;
 
     struct FailingGuard;
+
+    #[derive(Default)]
+    struct RejectingLoki {
+        batch_sizes: Mutex<Vec<usize>>,
+        request_received: Notify,
+    }
 
     impl Write for SharedGuard {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -570,6 +635,16 @@ mod tests {
         Json(payload): Json<Value>,
     ) {
         *captured.lock().unwrap() = Some(payload);
+    }
+
+    async fn reject_loki_payload(
+        State(state): State<Arc<RejectingLoki>>,
+        Json(payload): Json<Value>,
+    ) -> StatusCode {
+        let batch_size = payload["streams"][0]["values"].as_array().unwrap().len();
+        state.batch_sizes.lock().unwrap().push(batch_size);
+        state.request_received.notify_one();
+        StatusCode::INTERNAL_SERVER_ERROR
     }
 
     #[test]
@@ -691,6 +766,87 @@ mod tests {
             r#"{"event":"service_ready"}"#
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn worker_retains_failed_batch_and_accounts_for_shutdown_discards() {
+        let state = Arc::new(RejectingLoki::default());
+        let app = Router::new()
+            .route(LOKI_PUSH_PATH, post(reject_loki_payload))
+            .with_state(Arc::clone(&state));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = LokiConfig {
+            url: Url::parse(&format!("http://{address}{LOKI_PUSH_PATH}")).unwrap(),
+            host: "gate-test".into(),
+            site: "fcr-test".into(),
+        };
+        let metrics = Arc::new(LokiMetrics::default());
+        let (sender, receiver) = mpsc::channel(LOKI_BATCH_SIZE + 1);
+        for index in 0..=LOKI_BATCH_SIZE {
+            sender
+                .send(format!(r#"{{"event":"test-{index}"}}"#))
+                .await
+                .unwrap();
+        }
+        metrics
+            .events_enqueued
+            .store((LOKI_BATCH_SIZE + 1) as u64, Ordering::Relaxed);
+        metrics
+            .queue_depth
+            .store((LOKI_BATCH_SIZE + 1) as u64, Ordering::Relaxed);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let worker_metrics = Arc::clone(&metrics);
+        let worker = tokio::spawn(async move {
+            loki_worker(config, receiver, shutdown_receiver, worker_metrics).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), state.request_received.notified())
+            .await
+            .unwrap();
+        shutdown_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(*state.batch_sizes.lock().unwrap(), [LOKI_BATCH_SIZE; 2]);
+        assert_eq!(metrics.requests_failed.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            metrics.events_dropped.load(Ordering::Relaxed),
+            (LOKI_BATCH_SIZE + 1) as u64
+        );
+        assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 0);
+        server.abort();
+    }
+
+    #[test]
+    fn retained_batch_is_bounded_and_excess_is_counted() {
+        let metrics = LokiMetrics::default();
+        metrics.queue_depth.store(1, Ordering::Relaxed);
+        let clock = AtomicU64::new(0);
+        let mut batch = Vec::with_capacity(LOKI_MAX_RETAINED_EVENTS);
+        for index in 0..LOKI_MAX_RETAINED_EVENTS {
+            batch.push(LokiRecord {
+                timestamp_ns: index.to_string(),
+                line: "{}".into(),
+            });
+        }
+
+        retain_record(
+            &mut batch,
+            "{}".into(),
+            LOKI_MAX_RETAINED_EVENTS,
+            &clock,
+            &metrics,
+        );
+
+        assert_eq!(batch.len(), LOKI_MAX_RETAINED_EVENTS);
+        assert_eq!(metrics.events_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 0);
     }
 
     #[test]
