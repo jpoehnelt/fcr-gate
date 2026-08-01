@@ -23,28 +23,6 @@ pub struct TagInventoryEvent {
     pub antenna_port: Option<u16>,
     #[serde(default)]
     pub peak_rssi_cdbm: Option<i32>,
-    #[serde(default)]
-    pub tag_access_responses: Vec<TagAccessResponse>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct TagAccessResponse {
-    pub command: String,
-    #[serde(default)]
-    pub identifier: Option<String>,
-    pub response: String,
-    #[serde(default)]
-    pub data_hex: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TagObservation {
-    pub epc: String,
-    pub tid: String,
-    pub antenna_port: u16,
-    pub peak_rssi_cdbm: i32,
-    pub access_responses: Vec<TagAccessResponse>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,27 +34,6 @@ pub struct DiscoveryObservation {
     pub antenna_port: u16,
     pub peak_rssi_cdbm: i32,
     pub observed_at_ms: i64,
-}
-
-impl TagObservation {
-    pub fn from_reader_event(event: &ReaderEvent) -> Option<Self> {
-        if event.event_type != "tagInventory" {
-            return None;
-        }
-        let tag = event.tag_inventory_event.as_ref()?;
-        let epc = tag.epc_hex.as_ref()?.trim().to_ascii_uppercase();
-        let tid = tag.tid_hex.as_ref()?.trim().to_ascii_uppercase();
-        if !valid_even_hex(&epc) || !valid_even_hex(&tid) || tid.len() * 4 > 255 {
-            return None;
-        }
-        Some(Self {
-            epc,
-            tid,
-            antenna_port: tag.antenna_port?,
-            peak_rssi_cdbm: tag.peak_rssi_cdbm?,
-            access_responses: tag.tag_access_responses.clone(),
-        })
-    }
 }
 
 impl DiscoveryObservation {
@@ -129,7 +86,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_an_inventory_event_with_access_responses() {
+    fn ignores_unrelated_access_responses() {
         let event: ReaderEvent = serde_json::from_value(serde_json::json!({
             "eventType": "tagInventory",
             "timestamp": "2026-07-18T12:00:00.000Z",
@@ -148,9 +105,8 @@ mod tests {
         }))
         .unwrap();
 
-        let observation = TagObservation::from_reader_event(&event).unwrap();
-        assert_eq!(observation.tid, "E28011606000020497CB0065");
-        assert_eq!(observation.access_responses.len(), 1);
+        let observation = DiscoveryObservation::from_reader_event(&event).unwrap();
+        assert_eq!(observation.tid.as_deref(), Some("E28011606000020497CB0065"));
     }
 
     #[test]

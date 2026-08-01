@@ -1,5 +1,5 @@
 [Unit]
-Description=FCR Gate R700 RFID encoder
+Description=FCR Gate R700 RFID service
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=0
