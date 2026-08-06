@@ -29,9 +29,8 @@ package_version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
 
 cargo_target_dir="${CARGO_TARGET_DIR:-target}"
 binary_dir="$cargo_target_dir/$target/release"
-for binary in fcr-gate-admin fcr-rfid-encoder; do
-  [[ -x "$binary_dir/$binary" ]] || die "missing binary: $binary_dir/$binary"
-done
+[[ -x "$binary_dir/fcr-rfid-encoder" ]] ||
+  die "missing binary: $binary_dir/fcr-rfid-encoder"
 
 mkdir -p "$output_dir"
 output_dir="$(cd -- "$output_dir" && pwd)"
@@ -40,7 +39,6 @@ stage="$(mktemp -d)"
 trap 'rm -rf -- "$stage"' EXIT
 
 install -m 0755 "$binary_dir/fcr-rfid-encoder" "$stage/fcr-rfid-encoder"
-install -m 0755 "$binary_dir/fcr-gate-admin" "$stage/fcr-gate-admin"
 install -m 0644 deploy/fcr-rfid-encoder.service "$stage/fcr-rfid-encoder.service"
 install -m 0755 deploy/30-fcr-rfid-encoder.sh "$stage/30-fcr-rfid-encoder.sh"
 install -m 0644 deploy/gateway.env.example "$stage/gateway.env.example"
@@ -53,7 +51,6 @@ source_date_epoch="${SOURCE_DATE_EPOCH:-$(git show -s --format=%ct HEAD)}"
 members=(
   30-fcr-rfid-encoder.sh
   VERSION
-  fcr-gate-admin
   fcr-rfid-encoder
   fcr-rfid-encoder.service
   gateway.env.example

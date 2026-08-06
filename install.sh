@@ -15,7 +15,7 @@ usage() {
   cat <<'EOF'
 Usage: sudo bash install.sh [options]
 
-Install or update fcr-rfid-encoder and fcr-gate-admin from GitHub Releases.
+Install or update fcr-rfid-encoder from GitHub Releases.
 
 Options:
   --version TAG       Install a specific release tag, for example v0.1.0.
@@ -123,7 +123,6 @@ curl "${curl_args[@]}" --output "$tmpdir/$asset.sha256" "$release_base/$asset.sh
 expected_members=(
   30-fcr-rfid-encoder.sh
   VERSION
-  fcr-gate-admin
   fcr-rfid-encoder
   fcr-rfid-encoder.service
   gateway.env.example
@@ -143,20 +142,16 @@ done
 
 binary_version="$("$unpack_dir/fcr-rfid-encoder" --version)" ||
   die "downloaded binary did not execute on this gateway"
-admin_version="$("$unpack_dir/fcr-gate-admin" --version)" ||
-  die "downloaded admin binary did not execute on this gateway"
 archive_version="$(<"$unpack_dir/VERSION")"
 [[ "$archive_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] ||
   die "archive contains an invalid VERSION: $archive_version"
 [[ "$binary_version" == "fcr-rfid-encoder ${archive_version#v}" ]] ||
   die "binary version '$binary_version' does not match archive '$archive_version'"
-[[ "$admin_version" == "fcr-gate-admin ${archive_version#v}" ]] ||
-  die "admin version '$admin_version' does not match archive '$archive_version'"
 if [[ "$version" != "latest" ]]; then
   [[ "$archive_version" == "$version" ]] ||
     die "archive version '$archive_version' does not match requested release '$version'"
 fi
-log "verified $binary_version and $admin_version"
+log "verified $binary_version"
 
 install -d -m 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/bin" "$INSTALL_ROOT/deploy"
 install -d -m 0700 "$INSTALL_ROOT/secrets"
@@ -170,8 +165,6 @@ fi
 # currently running binary.
 install -m 0755 "$unpack_dir/fcr-rfid-encoder" "$INSTALL_ROOT/bin/fcr-rfid-encoder.new"
 mv -f "$INSTALL_ROOT/bin/fcr-rfid-encoder.new" "$INSTALL_ROOT/bin/fcr-rfid-encoder"
-install -m 0755 "$unpack_dir/fcr-gate-admin" "$INSTALL_ROOT/bin/fcr-gate-admin.new"
-mv -f "$INSTALL_ROOT/bin/fcr-gate-admin.new" "$INSTALL_ROOT/bin/fcr-gate-admin"
 install -m 0644 "$unpack_dir/fcr-rfid-encoder.service" \
   "$INSTALL_ROOT/deploy/fcr-rfid-encoder.service"
 install -m 0755 "$unpack_dir/30-fcr-rfid-encoder.sh" \
@@ -236,7 +229,7 @@ fi
 
 cat <<EOF
 
-Installed $binary_version and $admin_version under $INSTALL_ROOT.
+Installed $binary_version under $INSTALL_ROOT.
 
 Safety defaults on a first install:
   RFID_DISCOVERY_MODE=disabled
@@ -247,7 +240,7 @@ Useful checks:
   systemctl status fcr-rfid-encoder --no-pager
   journalctl -u fcr-rfid-encoder -f
   curl --fail-with-body http://127.0.0.1:8080/healthz
-  /data/fcr-gate/bin/fcr-gate-admin --help
+  /data/fcr-gate/bin/fcr-rfid-encoder --help
 
 Configuration: $environment_file
 EOF

@@ -1,14 +1,6 @@
-# Secrets — NEVER commit the UniFi API token
+# Secrets — never commit tokens or local env files
 .env
 .env.*
-!.env.example
-
-# License-plate PII and visitor records (contain plate numbers + visitor IDs)
-*.csv
-enrolled_visitors.json
-/tmp/plates*.json
-plates*.json
-license_plates*.json
 
 # Rust build output and local RFID encoder state
 target/
