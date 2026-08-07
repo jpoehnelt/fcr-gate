@@ -61,12 +61,17 @@ done
 
 binary_path="$unpack_dir/fcr-rfid-encoder"
 [[ -x "$binary_path" ]] || die "fcr-rfid-encoder is not executable"
-readelf -h "$binary_path" | grep -Fq "$expected_machine" ||
+header="$(readelf -h "$binary_path")" ||
+  die "cannot read ELF header of fcr-rfid-encoder"
+grep -Fq "$expected_machine" <<<"$header" ||
   die "fcr-rfid-encoder has the wrong architecture"
-if readelf -l "$binary_path" | grep -Fq 'INTERP'; then
+segments="$(readelf -l "$binary_path")" ||
+  die "cannot read ELF program headers of fcr-rfid-encoder"
+if grep -Fq 'INTERP' <<<"$segments"; then
   die "fcr-rfid-encoder has a dynamic program interpreter"
 fi
-if readelf -d "$binary_path" 2>/dev/null | grep -Fq '(NEEDED)'; then
+dynamic="$(readelf -d "$binary_path" 2>/dev/null || true)"
+if grep -Fq '(NEEDED)' <<<"$dynamic"; then
   die "fcr-rfid-encoder has a dynamic library dependency"
 fi
 
