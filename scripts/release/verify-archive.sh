@@ -40,7 +40,6 @@ esac
 expected_members=(
   30-fcr-rfid-encoder.sh
   VERSION
-  fcr-gate-admin
   fcr-rfid-encoder
   fcr-rfid-encoder.service
   gateway.env.example
@@ -60,24 +59,25 @@ for member in "${expected_members[@]}"; do
 done
 [[ "$(<"$unpack_dir/VERSION")" == "$tag" ]] || die "VERSION does not match $tag"
 
-for binary in fcr-gate-admin fcr-rfid-encoder; do
-  binary_path="$unpack_dir/$binary"
-  [[ -x "$binary_path" ]] || die "$binary is not executable"
-  readelf -h "$binary_path" | grep -Fq "$expected_machine" ||
-    die "$binary has the wrong architecture"
-  if readelf -l "$binary_path" | grep -Fq 'INTERP'; then
-    die "$binary has a dynamic program interpreter"
-  fi
-  if readelf -d "$binary_path" 2>/dev/null | grep -Fq '(NEEDED)'; then
-    die "$binary has a dynamic library dependency"
-  fi
-done
+binary_path="$unpack_dir/fcr-rfid-encoder"
+[[ -x "$binary_path" ]] || die "fcr-rfid-encoder is not executable"
+header="$(readelf -h "$binary_path")" ||
+  die "cannot read ELF header of fcr-rfid-encoder"
+grep -Fq "$expected_machine" <<<"$header" ||
+  die "fcr-rfid-encoder has the wrong architecture"
+segments="$(readelf -l "$binary_path")" ||
+  die "cannot read ELF program headers of fcr-rfid-encoder"
+if grep -Fq 'INTERP' <<<"$segments"; then
+  die "fcr-rfid-encoder has a dynamic program interpreter"
+fi
+dynamic="$(readelf -d "$binary_path" 2>/dev/null || true)"
+if grep -Fq '(NEEDED)' <<<"$dynamic"; then
+  die "fcr-rfid-encoder has a dynamic library dependency"
+fi
 
 if [[ "$(uname -m)" == x86_64 && "$target" == x86_64-unknown-linux-musl ]]; then
   [[ "$("$unpack_dir/fcr-rfid-encoder" --version)" == "fcr-rfid-encoder ${tag#v}" ]] ||
     die "encoder binary version does not match $tag"
-  [[ "$("$unpack_dir/fcr-gate-admin" --version)" == "fcr-rfid-encoder ${tag#v}" ]] ||
-    die "admin binary version does not match $tag"
 fi
 
 printf 'verified %s\n' "$archive"

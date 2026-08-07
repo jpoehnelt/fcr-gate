@@ -5,67 +5,40 @@ setup and `docs/gateway-services.md` for gateway operations.
 
 ## What this repo is
 
-Rust tools and services for the **FCR Gate** UniFi **Access** controller: extracting
-license-plate reads from the gate's system log, and enrolling plates as temporary
-recurring Visitors so they can pass the Entry Gate.
+Rust gateway service for the **FCR Gate** UniFi **Access** controller:
+`fcr-rfid-encoder` inventories an Impinj R700, learns vehicle RFID tags from
+repeated license-plate passages, and can authorize the Entry Gate from a tag
+owner's current UniFi Access user, policy, and schedule. It never writes EPCs and
+never mutates the Access directory — UniFi Access administration (users, visitors,
+plates) is done by a separate application.
 
 ## Controller / API facts
 
 - **Console:** `100.89.168.42`, UniFi **Access** Open API on **port 12445** (HTTPS).
-  - This is the **Access** API, NOT Protect. The `.env` key is an Access bearer
-    token. Protect endpoints (`/proxy/protect/...`, `X-API-KEY`) will 401 with it.
+  - This is the **Access** API, NOT Protect. The key is an Access bearer token;
+    Protect endpoints (`/proxy/protect/...`, `X-API-KEY`) will 401 with it.
   - Auth header: `Authorization: Bearer $UNIFI_API_KEY`.
-  - Self-signed cert — all calls skip TLS verification (`curl -k` / `CERT_NONE`).
+  - Self-signed cert — calls skip TLS verification unless `UNIFI_TLS_VERIFY=true`.
   - API reference PDF: <https://assets.identity.ui.com/unifi-access/api_reference.pdf>
 - **Entry Gate door id:** `1b620b81-f457-45f7-9fd2-27de1d8c4fdc` (building "FCR Gate").
-- Secrets live in `.env` (`UNIFI_API_KEY=...`). Never hardcode the token; the Rust
-  admin CLI reads it from `.env` or `UNIFI_API_KEY_FILE`. Do not commit real tokens.
+- The service reads its UniFi credentials from the environment (`UNIFI_API_KEY_FILE`
+  preferred, or `UNIFI_API_KEY`); on the gateway these live under
+  `/data/fcr-gate/secrets/`. Never hardcode or commit real tokens.
 
-## Key API endpoints
+## Access API usage (read/authorize only)
 
-| Purpose | Method | Path |
-| --- | --- | --- |
-| Fetch system logs (plate reads) | POST | `/api/v1/developer/system/logs` (body `{topic,since,until}`) |
-| Create visitor | POST | `/api/v1/developer/visitors` |
-| Assign plates to visitor | PUT | `/api/v1/developer/visitors/:id/license_plates` (body `["PLATE",...]`) |
-| List all visitors | GET | `/api/v1/developer/visitors?page_num=&page_size=` |
-| Visitor detail | GET | `/api/v1/developer/visitors/:id` |
-| Delete (soft-cancel) visitor | DELETE | `/api/v1/developer/visitors/:id` |
-| Unassign one plate | DELETE | `/api/v1/developer/visitors/:id/license_plates/:plate_id` |
-
-- **Visitor status enum:** `UPCOMING=1, VISITED=2, VISITING=3, CANCELLED=4, NO_VISIT=5, ACTIVE=6`.
-- **`DELETE /visitors/:id` is a soft cancel**, not a hard delete. It sets status to
-  `CANCELLED` but the shell record (and any attached plates) stays in the directory.
-  There is **no hard-delete endpoint** — cancelled shells must be cleared in the
-  Access UI or they expire at `end_time`. A plate left bound to a cancelled visitor
-  can block re-registering that plate to a real user, so strip plates on cleanup
-  (`fcr-gate-admin cleanup-visitors`).
-
-- Plate reads = `door_openings` log entries where
-  `authentication.credential_provider == "LICENSEPLATE"`; plate is `authentication.issuer`.
-- A Visitor is the "temporary user" primitive: `start_time`/`end_time` validity plus
-  an optional `week_schedule`. **Presence of `week_schedule` ⇒ recurring; absence ⇒
-  one-time.** 24/7 = every day `00:00:00`–`23:59:59`.
+- Plate reads = `door_openings` system-log entries where
+  `authentication.credential_provider == "LICENSEPLATE"`; the plate is
+  `authentication.issuer`. Only entry-side events participate in discovery.
+- Gate authorization reads the current user, their access policy, door group,
+  weekly schedule, and holidays before issuing a remote unlock. See `src/unifi.rs`
+  for the exact endpoints and decision logic.
 
 ## Binaries
 
-- `fcr-gate-admin extract-plates` — pull plate reads to CSV.
-  - `--days N` (default 2) or `--all` (full retained history).
-  - `--out CSV` and optional `--json DUMP` (the dump feeds `enroll-plates`).
-- `fcr-gate-admin enroll-plates` — create one recurring 24/7 Visitor per plate from
-  `/tmp/plates_all.json`.
-  - `--dry-run` prints the plan and makes NO changes; `--apply` is live.
-  - Deduplicates OCR variants (`O`↔`0`, `I`↔`1`) and attaches them to one visitor.
-  - Tags visitors with remark `LPR_BULK`, names them `LPR <plate>`.
-  - Writes `enrolled_visitors.json` (per-plate result + `visitor_id`).
-- `fcr-gate-admin cleanup-visitors` — undo a bulk enroll. Soft-cancels every `LPR_BULK`
-  visitor and unassigns all their plates. `--dry-run` / `--apply`. Cannot remove
-  the cancelled shells (no API hard-delete) — those need the Access UI.
-- `fcr-gate-admin epc-report` — inspect an Impinj reported-EPC CSV offline.
 - `fcr-rfid-encoder` — long-running R700 TID inventory service, health endpoint,
   optional UniFi-authorized Entry Gate trigger, and multi-visit vehicle-tag
-  discovery. The binary name is retained for deployment compatibility; it never
-  writes EPCs.
+  discovery. It never writes EPCs.
   - `discovery-status` reports retained tag-to-plate evidence. Visitor-backed
     candidates remain `needs-resident`.
   - `associate-discovered TAG_KEY UNIFI_USER_ID --dry-run` validates a proposed
@@ -75,17 +48,11 @@ recurring Visitors so they can pass the Entry Gate.
 
 - All application code is Rust; Bash is limited to gateway installation and
   release automation.
-- Date math uses Unix seconds. The Rust CLI writes `enrolled_visitors.json` after
-  completing a live enrollment run.
-- **Live access-control system.** Creating/deleting visitors changes who can enter
-  the gate. Always `--dry-run` before `--apply`. Note that every historical plate
-  read was `BLOCKED` (unknown) before enrollment, so the bulk enroll grants access
-  to formerly-denied vehicles, including OCR noise — review before trusting.
-
-## Rollback
-
-Use `fcr-gate-admin cleanup-visitors --dry-run`, review the result, then use
-`--apply`. It soft-cancels matching visitors and strips their plate associations.
+- Date math uses Unix seconds.
+- **Live access-control system.** Gate authorization and discovery default to
+  disabled; use `dry-run` before setting either to `live`. Only entry-side
+  license-plate events participate in discovery; exit-side and directionless
+  events fail closed.
 
 ## Release invariants
 

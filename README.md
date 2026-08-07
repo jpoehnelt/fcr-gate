@@ -1,15 +1,13 @@
 # FCR Gate
 
-Rust tools and gateway services for the FCR Gate UniFi Access controller. The
-project extracts license-plate reads, manages temporary recurring visitors,
-learns vehicle RFID tags through an Impinj R700, and can authorize the Entry Gate
-from a tag owner's current UniFi policy and schedule.
+Rust gateway service for the FCR Gate UniFi Access controller. It learns vehicle
+RFID tags through an Impinj R700 and can authorize the Entry Gate from a tag
+owner's current UniFi policy and schedule.
 
 ## Components
 
 | Component | Purpose | Safety default |
 | --- | --- | --- |
-| `fcr-gate-admin` | License-plate administration and offline EPC reports | Mutating commands require `--apply` |
 | `fcr-rfid-encoder` | R700 TID discovery, tag ownership, health, and gate authorization | Discovery and gate unlocks disabled |
 | `deploy/` | Persistent systemd units and UniFi boot hooks | Local-only services and root-owned secrets |
 
@@ -20,69 +18,13 @@ toolchain in `rust-toolchain.toml`.
 
 ```bash
 cargo build --release --locked
-cp .env.example .env
 ```
 
-Add the UniFi Access bearer token to `.env`:
-
-```dotenv
-UNIFI_API_KEY=<token>
-```
-
-Process environment variables override `.env`. `UNIFI_API_KEY_FILE` is preferred
-for long-running services. Never commit `.env`, secret files, exported plate data,
-or the RFID service's SQLite database.
-
-## UniFi Access administration
-
-### Extract license-plate reads
-
-```bash
-target/release/fcr-gate-admin extract-plates
-target/release/fcr-gate-admin extract-plates --days 7
-target/release/fcr-gate-admin extract-plates --all \
-  --out license_plates_all.csv --json /tmp/plates_all.json
-```
-
-The default window is two days. The CSV contains
-`timestamp,plate,result,gate,door_id`; the optional JSON output feeds the visitor
-enrollment command.
-
-### Enroll and remove visitors
-
-Review the enrollment plan before making a live access-control change:
-
-```bash
-target/release/fcr-gate-admin enroll-plates --dry-run
-target/release/fcr-gate-admin enroll-plates --apply
-```
-
-The command reads `/tmp/plates_all.json`, groups common OCR variants, creates one
-recurring visitor per plate group, and records the result in
-`enrolled_visitors.json`.
-
-> [!WARNING]
-> Historical reads can include denied vehicles, pass-by traffic, and OCR noise.
-> Enrollment grants real Entry Gate access to the selected plates.
-
-Rollback also starts with a dry run:
-
-```bash
-target/release/fcr-gate-admin cleanup-visitors --dry-run
-target/release/fcr-gate-admin cleanup-visitors --apply
-```
-
-UniFi only soft-cancels visitors. Cleanup removes their plate associations and
-cancels the visitor records, but the cancelled shells remain until they expire or
-are cleared in the Access UI.
-
-### Inspect an EPC report
-
-```bash
-target/release/fcr-gate-admin epc-report reported_EPCs.csv --list
-```
-
-This operation is offline and never changes the reader.
+The gateway service reads its configuration and UniFi Access credentials from the
+environment; see `deploy/gateway.env.example`. On the gateway these live under
+`/data/fcr-gate/secrets/`, and `UNIFI_API_KEY_FILE` is preferred over
+`UNIFI_API_KEY` for the long-running service. Never commit secret files or the
+RFID service's SQLite database.
 
 ## RFID gateway service
 
@@ -146,8 +88,8 @@ curl -fsSL -o /tmp/install-fcr-gate.sh \
 bash /tmp/install-fcr-gate.sh --version "$TAG"
 ```
 
-The installer verifies the archive checksum, member list, binary versions, and
-target architecture. It installs both binaries atomically, preserves existing
+The installer verifies the archive checksum, member list, binary version, and
+target architecture. It installs the binary atomically, preserves existing
 configuration and secrets, installs the systemd unit and boot hook, and starts the
 service. `--no-start` installs and enables the service without restarting it.
 
@@ -192,9 +134,6 @@ npx --yes markdownlint-cli2@0.23.1 '**/*.md' '#target/**'
 CI also verifies Rust 1.85 compatibility, command interfaces, shell scripts, and
 workflow syntax. The Security workflow runs Gitleaks, RustSec, and pull-request
 dependency review; RustSec also runs weekly.
-
-Live UniFi behavior must still be tested with `--dry-run` before any `--apply`
-command.
 
 ## Publish a release
 

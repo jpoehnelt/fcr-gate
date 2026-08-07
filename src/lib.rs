@@ -1,4 +1,3 @@
-pub mod admin;
 pub mod config;
 pub mod impinj;
 pub mod logging;

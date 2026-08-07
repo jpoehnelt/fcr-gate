@@ -48,11 +48,6 @@ jobs:
       - name: Smoke-test command interfaces
         run: |
           cargo run --locked --bin fcr-rfid-encoder -- --help >/dev/null
-          cargo run --locked --bin fcr-gate-admin -- --help >/dev/null
-          cargo run --locked --bin fcr-gate-admin -- extract-plates --help >/dev/null
-          cargo run --locked --bin fcr-gate-admin -- enroll-plates --help >/dev/null
-          cargo run --locked --bin fcr-gate-admin -- cleanup-visitors --help >/dev/null
-          cargo run --locked --bin fcr-gate-admin -- epc-report --help >/dev/null
 
   msrv:
     name: Rust 1.85 minimum version
