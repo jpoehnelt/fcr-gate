@@ -9,9 +9,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
-use reqwest::{Client, Response, StatusCode};
+use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -89,17 +88,7 @@ struct ActivePreset {
     profile: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProfileAction {
-    Reuse,
-    Install,
-}
-
-fn plan_profile_action(
-    status: &ReaderStatus,
-    profile_id: &str,
-    reuse_only: bool,
-) -> Result<ProfileAction> {
+fn active_inventory_preset(status: &ReaderStatus) -> Result<String> {
     if status.interface != "IoT" {
         bail!(
             "reader interface is {}; select the Impinj IoT Device Interface before running the RFID service",
@@ -115,23 +104,18 @@ fn plan_profile_action(
                 .active_preset
                 .as_ref()
                 .context("reader is active but did not report an active preset")?;
-            if active.profile == "inventory" && active.id.as_deref() == Some(profile_id) {
-                return Ok(ProfileAction::Reuse);
-            }
-            bail!(
-                "reader is already running profile {} ({}) and will not be taken over",
-                active.profile,
-                active.id.as_deref().unwrap_or("transient")
-            );
-        }
-        Some("idle") => {
-            if reuse_only {
+            if active.profile != "inventory" {
                 bail!(
-                    "reader is idle and IMPINJ_PRESET_REUSE_ONLY=true; refusing to install or start preset {profile_id}"
+                    "reader is running profile {} ({}); the service only streams an externally managed inventory preset",
+                    active.profile,
+                    active.id.as_deref().unwrap_or("transient")
                 );
             }
-            Ok(ProfileAction::Install)
+            Ok(active.id.as_deref().unwrap_or("transient").to_owned())
         }
+        Some("idle") => bail!(
+            "reader is idle; start the externally managed inventory preset before running the RFID service"
+        ),
         Some(other) => bail!("reader is in unsupported state {other}"),
         None => bail!("reader did not report an IoT inventory state"),
     }
@@ -162,7 +146,9 @@ impl ImpinjClient {
         self.health.clone()
     }
 
-    pub async fn ensure_profile(&self, config: &Config) -> Result<()> {
+    /// Verifies that an externally managed inventory preset is already running.
+    /// The service never installs, overwrites, starts, or stops reader presets.
+    pub async fn require_inventory_preset(&self) -> Result<()> {
         let status: ReaderStatus = self
             .authorized(self.http.get(self.url("/status")).timeout(REQUEST_TIMEOUT))
             .send()
@@ -173,68 +159,8 @@ impl ImpinjClient {
             .json()
             .await
             .context("invalid reader status response")?;
-        match plan_profile_action(&status, &config.profile_id, config.preset_reuse_only)? {
-            ProfileAction::Reuse => {
-                info!(event = "reader_profile_reused", profile = %config.profile_id, "reusing active reader profile");
-                return Ok(());
-            }
-            ProfileAction::Install => {}
-        }
-
-        let profile = build_inventory_request(config);
-        let response = self
-            .authorized(
-                self.http
-                    .put(self.url(&format!(
-                        "/profiles/inventory/presets/{}",
-                        config.profile_id
-                    )))
-                    .timeout(REQUEST_TIMEOUT)
-                    .json(&profile),
-            )
-            .send()
-            .await
-            .context("failed to install reader profile")?;
-        expect(
-            response,
-            &[StatusCode::CREATED, StatusCode::NO_CONTENT],
-            "install profile",
-        )
-        .await?;
-
-        let response = self
-            .authorized(
-                self.http
-                    .post(self.url(&format!(
-                        "/profiles/inventory/presets/{}/start",
-                        config.profile_id
-                    )))
-                    .timeout(REQUEST_TIMEOUT),
-            )
-            .send()
-            .await
-            .context("failed to start reader profile")?;
-        expect(response, &[StatusCode::NO_CONTENT], "start profile").await?;
-        info!(event = "reader_profile_started", profile = %config.profile_id, "reader inventory profile started");
-        Ok(())
-    }
-
-    pub async fn stop_profile(&self, profile_id: &str) -> Result<()> {
-        let response = self
-            .authorized(
-                self.http
-                    .post(self.url(&format!("/profiles/inventory/presets/{profile_id}/stop")))
-                    .timeout(REQUEST_TIMEOUT),
-            )
-            .send()
-            .await
-            .context("failed to stop reader profile")?;
-        expect(response, &[StatusCode::NO_CONTENT], "stop profile").await?;
-        info!(
-            event = "reader_profile_stopped",
-            profile = profile_id,
-            "reader inventory profile stopped"
-        );
+        let preset = active_inventory_preset(&status)?;
+        info!(event = "reader_preset_reused", preset = %preset, "streaming the externally managed inventory preset");
         Ok(())
     }
 
@@ -322,50 +248,6 @@ fn system_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn build_inventory_request(config: &Config) -> Value {
-    json!({
-        "eventConfig": {
-            "common": { "hostname": "enabled" },
-            "tagInventory": {
-                "tagReporting": {
-                    "reportingIntervalSeconds": 0,
-                    "tagIdentifier": "tid",
-                    "antennaIdentifier": "antennaPort"
-                },
-                "epc": "disabled",
-                "epcHex": "enabled",
-                "tid": "disabled",
-                "tidHex": "enabled",
-                "antennaPort": "enabled",
-                "transmitPowerCdbm": "enabled",
-                "peakRssiCdbm": "enabled",
-                "frequency": "disabled",
-                "pc": "disabled"
-            }
-        },
-        "antennaConfigs": [{
-            "antennaName": "fcr-gate-reader",
-            "antennaPort": config.antenna_port,
-            "transmitPowerCdbm": config.transmit_power_cdbm,
-            "rfMode": config.rf_mode,
-            "inventorySession": 1,
-            "inventorySearchMode": "dual-target",
-            "estimatedTagPopulation": 16,
-            "fastId": "enabled"
-        }]
-    })
-}
-
-async fn expect(response: Response, allowed: &[StatusCode], operation: &str) -> Result<Response> {
-    if allowed.contains(&response.status()) {
-        return Ok(response);
-    }
-    let status = response.status();
-    let mut detail = response.text().await.unwrap_or_default();
-    detail.truncate(1000);
-    bail!("reader failed to {operation}: HTTP {status}: {detail}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,36 +284,27 @@ mod tests {
     }
 
     #[test]
-    fn running_matching_preset_is_reused_without_writes() {
-        for reuse_only in [false, true] {
-            let action = plan_profile_action(
-                &status(Some("running"), Some(("Preferred", "inventory"))),
-                "Preferred",
-                reuse_only,
-            )
-            .unwrap();
-            assert_eq!(action, ProfileAction::Reuse);
-        }
+    fn running_inventory_preset_is_reused_whatever_its_name() {
+        let preset =
+            active_inventory_preset(&status(Some("running"), Some(("Preferred", "inventory"))))
+                .unwrap();
+        assert_eq!(preset, "Preferred");
     }
 
     #[test]
-    fn running_foreign_preset_is_never_taken_over() {
-        let error = plan_profile_action(
-            &status(Some("running"), Some(("Preferred", "inventory"))),
-            "fcr-gate-reader",
-            false,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("will not be taken over"));
+    fn non_inventory_profile_is_refused() {
+        let error = active_inventory_preset(&status(Some("running"), Some(("custom", "location"))))
+            .unwrap_err();
+        assert!(error.to_string().contains("only streams"));
     }
 
     #[test]
-    fn idle_reader_installs_only_when_preset_is_managed() {
-        let action = plan_profile_action(&status(Some("idle"), None), "fcr-gate-reader", false);
-        assert_eq!(action.unwrap(), ProfileAction::Install);
-
-        let error =
-            plan_profile_action(&status(Some("idle"), None), "Preferred", true).unwrap_err();
-        assert!(error.to_string().contains("refusing to install"));
+    fn idle_reader_is_refused_without_any_preset_write() {
+        let error = active_inventory_preset(&status(Some("idle"), None)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("start the externally managed inventory preset")
+        );
     }
 }
