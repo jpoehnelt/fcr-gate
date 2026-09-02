@@ -1,6 +1,8 @@
 # Secrets — never commit tokens or local env files
 .env
 .env.*
+.secrets/
+.state/
 
 # Rust build output and local RFID encoder state
 target/

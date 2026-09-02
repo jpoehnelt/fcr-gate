@@ -59,10 +59,7 @@ pub struct Config {
     pub reader_password: String,
     pub verify_tls: bool,
     pub ca_certificate: Option<PathBuf>,
-    pub profile_id: String,
     pub antenna_port: u16,
-    pub transmit_power_cdbm: i32,
-    pub rf_mode: u16,
     pub state_db: PathBuf,
     pub actor: String,
     pub health_enabled: bool,
@@ -101,9 +98,6 @@ impl Config {
             bail!("IMPINJ_CA_CERTIFICATE requires IMPINJ_TLS_VERIFY=true");
         }
 
-        let profile_id = validate_profile_id(
-            &env::var("IMPINJ_PROFILE_ID").unwrap_or_else(|_| "fcr-gate-reader".into()),
-        )?;
         let health_enabled = boolean("FCR_GATE_HEALTH_ENABLED", true)?;
         let gate_mode =
             parse_gate_mode(&env::var("RFID_GATE_MODE").unwrap_or_else(|_| "disabled".into()))?;
@@ -167,10 +161,7 @@ impl Config {
             reader_password,
             verify_tls,
             ca_certificate,
-            profile_id,
             antenna_port: number("IMPINJ_ANTENNA_PORT", 1)?,
-            transmit_power_cdbm: number("IMPINJ_TX_POWER_CDBM", 3000)?,
-            rf_mode: number("IMPINJ_RF_MODE", 4)?,
             state_db: state_db_path(),
             actor: env::var("RFID_SERVICE_ACTOR").unwrap_or_else(|_| "gate-auto".into()),
             health_enabled,
@@ -305,19 +296,6 @@ fn validate_uuid(value: &str, name: &str) -> Result<String> {
     Ok(value)
 }
 
-fn validate_profile_id(value: &str) -> Result<String> {
-    let value = value.trim();
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        bail!("IMPINJ_PROFILE_ID may contain only letters, digits, dot, dash, and underscore");
-    }
-    Ok(value.to_owned())
-}
-
 pub fn normalize_hex(value: &str, exact_len: Option<usize>, name: &str) -> Result<String> {
     let normalized = value.trim().to_ascii_uppercase();
     if normalized.is_empty() || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -408,15 +386,6 @@ mod tests {
         assert!(normalize_base_url("https://reader.local/path").is_err());
         assert!(normalize_base_url("https://user:password@reader.local").is_err());
         assert!(normalize_base_url("https://reader.local?query=value").is_err());
-    }
-
-    #[test]
-    fn profile_id_is_safe_for_a_url_path() {
-        assert_eq!(
-            validate_profile_id(" fcr-gate_encoder.1 ").unwrap(),
-            "fcr-gate_encoder.1"
-        );
-        assert!(validate_profile_id("../other/profile").is_err());
     }
 
     #[test]

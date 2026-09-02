@@ -9,9 +9,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
-use reqwest::{Client, Response, StatusCode};
+use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -89,6 +89,95 @@ struct ActivePreset {
     profile: String,
 }
 
+fn active_inventory_preset(status: &ReaderStatus) -> Result<Option<String>> {
+    if status.interface != "IoT" {
+        bail!(
+            "reader interface is {}; select the Impinj IoT Device Interface before running the RFID service",
+            status.interface
+        );
+    }
+    if status.status.as_deref() == Some("no region") {
+        bail!("reader has no regulatory region configured");
+    }
+    match status.status.as_deref() {
+        Some("running" | "armed") => {
+            let active = status
+                .active_preset
+                .as_ref()
+                .context("reader is active but did not report an active preset")?;
+            if active.profile != "inventory" {
+                bail!(
+                    "reader is running profile {} ({}); the service only streams an externally managed inventory preset",
+                    active.profile,
+                    active.id.as_deref().unwrap_or("transient")
+                );
+            }
+            Ok(active.id.clone())
+        }
+        Some("idle") => bail!(
+            "reader is idle; start the externally managed inventory preset before running the RFID service"
+        ),
+        Some(other) => bail!("reader is in unsupported state {other}"),
+        None => bail!("reader did not report an IoT inventory state"),
+    }
+}
+
+/// Read-only check that the externally owned preset reports the fields learned
+/// ownership depends on: TID (via FastID) on the watched antenna. An EPC-only
+/// preset would silently downgrade tag keys from TID to `EPC:<epc>`.
+///
+/// The R700 omits defaulted keys from preset bodies, so an absent key means
+/// "reader default", not "disabled": warn and continue. Only an explicit
+/// non-enabled value fails startup.
+fn verify_tid_reporting(preset: &Value, preset_id: &str, antenna_port: u16) -> Result<()> {
+    match preset
+        .pointer("/eventConfig/tagInventory/tidHex")
+        .and_then(Value::as_str)
+    {
+        Some("enabled") => {}
+        Some(other) => bail!(
+            "preset {preset_id} sets eventConfig.tagInventory.tidHex to {other}; enable TID reporting on the reader before running the RFID service"
+        ),
+        None => warn!(
+            event = "reader_preset_tid_unverified",
+            preset = preset_id,
+            "preset omits eventConfig.tagInventory.tidHex; relying on the reader default"
+        ),
+    }
+    let antenna = match preset.pointer("/antennaConfigs").and_then(Value::as_array) {
+        None => {
+            warn!(
+                event = "reader_preset_antenna_unverified",
+                preset = preset_id,
+                "preset omits antennaConfigs; relying on the reader default"
+            );
+            return Ok(());
+        }
+        Some(configs) => configs
+            .iter()
+            .find(|config| {
+                config.pointer("/antennaPort").and_then(Value::as_u64)
+                    == Some(u64::from(antenna_port))
+            })
+            .with_context(|| {
+                format!("preset {preset_id} has no antennaConfig for antenna port {antenna_port}")
+            })?,
+    };
+    match antenna.pointer("/fastId").and_then(Value::as_str) {
+        Some("enabled") => {}
+        Some(other) => bail!(
+            "preset {preset_id} sets fastId to {other} on antenna port {antenna_port}; TID reporting requires FastID"
+        ),
+        None => warn!(
+            event = "reader_preset_fastid_unverified",
+            preset = preset_id,
+            antenna = antenna_port,
+            "preset omits fastId on the watched antenna; relying on the reader default"
+        ),
+    }
+    Ok(())
+}
+
 impl ImpinjClient {
     pub fn new(config: &Config) -> Result<Self> {
         let mut builder = Client::builder()
@@ -114,7 +203,10 @@ impl ImpinjClient {
         self.health.clone()
     }
 
-    pub async fn ensure_profile(&self, config: &Config) -> Result<()> {
+    /// Verifies that an externally managed inventory preset is already running
+    /// and reports the fields discovery depends on. The service never installs,
+    /// overwrites, starts, or stops reader presets.
+    pub async fn require_inventory_preset(&self, config: &Config) -> Result<()> {
         let status: ReaderStatus = self
             .authorized(self.http.get(self.url("/status")).timeout(REQUEST_TIMEOUT))
             .send()
@@ -125,91 +217,29 @@ impl ImpinjClient {
             .json()
             .await
             .context("invalid reader status response")?;
-        if status.interface != "IoT" {
-            bail!(
-                "reader interface is {}; select the Impinj IoT Device Interface before running the RFID service",
-                status.interface
+        let Some(preset_id) = active_inventory_preset(&status)? else {
+            warn!(
+                event = "reader_preset_unverified",
+                "the active inventory preset is transient; cannot verify TID reporting"
             );
-        }
-        if status.status.as_deref() == Some("no region") {
-            bail!("reader has no regulatory region configured");
-        }
-        match status.status.as_deref() {
-            Some("running" | "armed") => {
-                let active = status
-                    .active_preset
-                    .context("reader is active but did not report an active preset")?;
-                if active.profile == "inventory"
-                    && active.id.as_deref() == Some(config.profile_id.as_str())
-                {
-                    info!(event = "reader_profile_reused", profile = %config.profile_id, "reusing active reader profile");
-                    return Ok(());
-                }
-                bail!(
-                    "reader is already running profile {} ({}) and will not be taken over",
-                    active.profile,
-                    active.id.as_deref().unwrap_or("transient")
-                );
-            }
-            Some("idle") => {}
-            Some(other) => bail!("reader is in unsupported state {other}"),
-            None => bail!("reader did not report an IoT inventory state"),
-        }
-
-        let profile = build_inventory_request(config);
-        let response = self
+            return Ok(());
+        };
+        let preset: Value = self
             .authorized(
                 self.http
-                    .put(self.url(&format!(
-                        "/profiles/inventory/presets/{}",
-                        config.profile_id
-                    )))
-                    .timeout(REQUEST_TIMEOUT)
-                    .json(&profile),
-            )
-            .send()
-            .await
-            .context("failed to install reader profile")?;
-        expect(
-            response,
-            &[StatusCode::CREATED, StatusCode::NO_CONTENT],
-            "install profile",
-        )
-        .await?;
-
-        let response = self
-            .authorized(
-                self.http
-                    .post(self.url(&format!(
-                        "/profiles/inventory/presets/{}/start",
-                        config.profile_id
-                    )))
+                    .get(self.url(&format!("/profiles/inventory/presets/{preset_id}")))
                     .timeout(REQUEST_TIMEOUT),
             )
             .send()
             .await
-            .context("failed to start reader profile")?;
-        expect(response, &[StatusCode::NO_CONTENT], "start profile").await?;
-        info!(event = "reader_profile_started", profile = %config.profile_id, "reader inventory profile started");
-        Ok(())
-    }
-
-    pub async fn stop_profile(&self, profile_id: &str) -> Result<()> {
-        let response = self
-            .authorized(
-                self.http
-                    .post(self.url(&format!("/profiles/inventory/presets/{profile_id}/stop")))
-                    .timeout(REQUEST_TIMEOUT),
-            )
-            .send()
+            .context("failed to fetch the active preset")?
+            .error_for_status()
+            .context("active preset request failed")?
+            .json()
             .await
-            .context("failed to stop reader profile")?;
-        expect(response, &[StatusCode::NO_CONTENT], "stop profile").await?;
-        info!(
-            event = "reader_profile_stopped",
-            profile = profile_id,
-            "reader inventory profile stopped"
-        );
+            .context("invalid active preset response")?;
+        verify_tid_reporting(&preset, &preset_id, config.antenna_port)?;
+        info!(event = "reader_preset_reused", preset = %preset_id, "streaming the externally managed inventory preset");
         Ok(())
     }
 
@@ -297,50 +327,6 @@ fn system_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn build_inventory_request(config: &Config) -> Value {
-    json!({
-        "eventConfig": {
-            "common": { "hostname": "enabled" },
-            "tagInventory": {
-                "tagReporting": {
-                    "reportingIntervalSeconds": 0,
-                    "tagIdentifier": "tid",
-                    "antennaIdentifier": "antennaPort"
-                },
-                "epc": "disabled",
-                "epcHex": "enabled",
-                "tid": "disabled",
-                "tidHex": "enabled",
-                "antennaPort": "enabled",
-                "transmitPowerCdbm": "enabled",
-                "peakRssiCdbm": "enabled",
-                "frequency": "disabled",
-                "pc": "disabled"
-            }
-        },
-        "antennaConfigs": [{
-            "antennaName": "fcr-gate-reader",
-            "antennaPort": config.antenna_port,
-            "transmitPowerCdbm": config.transmit_power_cdbm,
-            "rfMode": config.rf_mode,
-            "inventorySession": 1,
-            "inventorySearchMode": "dual-target",
-            "estimatedTagPopulation": 16,
-            "fastId": "enabled"
-        }]
-    })
-}
-
-async fn expect(response: Response, allowed: &[StatusCode], operation: &str) -> Result<Response> {
-    if allowed.contains(&response.status()) {
-        return Ok(response);
-    }
-    let status = response.status();
-    let mut detail = response.text().await.unwrap_or_default();
-    detail.truncate(1000);
-    bail!("reader failed to {operation}: HTTP {status}: {detail}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +349,89 @@ mod tests {
         let reconnecting = health.snapshot();
         assert!(!reconnecting.connected);
         assert_eq!(reconnecting.last_activity_ms, connected.last_activity_ms);
+    }
+
+    fn status(state: Option<&str>, preset: Option<(&str, &str)>) -> ReaderStatus {
+        ReaderStatus {
+            interface: "IoT".into(),
+            status: state.map(Into::into),
+            active_preset: preset.map(|(id, profile)| ActivePreset {
+                id: Some(id.into()),
+                profile: profile.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn running_inventory_preset_is_reused_whatever_its_name() {
+        let preset =
+            active_inventory_preset(&status(Some("running"), Some(("Preferred", "inventory"))))
+                .unwrap();
+        assert_eq!(preset.as_deref(), Some("Preferred"));
+    }
+
+    #[test]
+    fn non_inventory_profile_is_refused() {
+        let error = active_inventory_preset(&status(Some("running"), Some(("custom", "location"))))
+            .unwrap_err();
+        assert!(error.to_string().contains("only streams"));
+    }
+
+    #[test]
+    fn idle_reader_is_refused_without_any_preset_write() {
+        let error = active_inventory_preset(&status(Some("idle"), None)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("start the externally managed inventory preset")
+        );
+    }
+
+    fn preset(tid_hex: &str, antenna_port: u16, fast_id: &str) -> Value {
+        serde_json::json!({
+            "eventConfig": { "tagInventory": { "epcHex": "enabled", "tidHex": tid_hex } },
+            "antennaConfigs": [{ "antennaPort": antenna_port, "fastId": fast_id }]
+        })
+    }
+
+    #[test]
+    fn preset_with_tid_reporting_on_the_watched_antenna_passes() {
+        verify_tid_reporting(&preset("enabled", 1, "enabled"), "Preferred", 1).unwrap();
+    }
+
+    #[test]
+    fn preset_relying_on_reader_defaults_warns_but_streams() {
+        // Literal body of the live R700 `default` preset: the reader omits
+        // defaulted keys (no eventConfig, no fastId), so absence must not bail.
+        let default_preset = serde_json::json!({
+            "antennaConfigs": [{
+                "antennaPort": 1,
+                "transmitPowerCdbm": 3300,
+                "inventorySession": 2,
+                "inventorySearchMode": "dual-target",
+                "estimatedTagPopulation": 32,
+                "rfMode": 1110
+            }]
+        });
+        verify_tid_reporting(&default_preset, "default", 1).unwrap();
+        verify_tid_reporting(&serde_json::json!({}), "bare", 1).unwrap();
+    }
+
+    #[test]
+    fn explicitly_epc_only_preset_is_refused_before_streaming() {
+        let error =
+            verify_tid_reporting(&preset("disabled", 1, "enabled"), "Preferred", 1).unwrap_err();
+        assert!(error.to_string().contains("tidHex"));
+    }
+
+    #[test]
+    fn preset_without_fastid_or_watched_antenna_is_refused() {
+        let error =
+            verify_tid_reporting(&preset("enabled", 1, "disabled"), "Preferred", 1).unwrap_err();
+        assert!(error.to_string().contains("fastId"));
+
+        let error =
+            verify_tid_reporting(&preset("enabled", 2, "enabled"), "Preferred", 1).unwrap_err();
+        assert!(error.to_string().contains("no antennaConfig"));
     }
 }

@@ -112,7 +112,7 @@ async fn run(loki_metrics: std::sync::Arc<logging::LokiMetrics>) -> Result<()> {
     let mut store = Store::open(&config.state_db, config.actor.clone())?;
 
     let reader = ImpinjClient::new(&config)?;
-    reader.ensure_profile(&config).await?;
+    reader.require_inventory_preset(&config).await?;
     let reader_health = reader.health();
     let unifi = (config.gate_mode.enabled() || config.discovery_mode.enabled())
         .then(|| UnifiClient::new(&config))
@@ -153,9 +153,6 @@ async fn run(loki_metrics: std::sync::Arc<logging::LokiMetrics>) -> Result<()> {
                 result?;
                 info!(event = "service_shutdown_requested", "shutdown requested");
                 stream_task.abort();
-                if let Err(error) = reader.stop_profile(&config.profile_id).await {
-                    warn!(event = "reader_profile_stop_failed", %error, "could not stop the owned reader profile during shutdown");
-                }
                 if let Some(web_handle) = web_handle {
                     web_handle.shutdown().await;
                 }
@@ -1127,10 +1124,7 @@ mod tests {
             reader_password: "secret".into(),
             verify_tls: false,
             ca_certificate: None,
-            profile_id: "test".into(),
             antenna_port: 1,
-            transmit_power_cdbm: 3000,
-            rf_mode: 4,
             state_db: db,
             actor: "test".into(),
             health_enabled: false,

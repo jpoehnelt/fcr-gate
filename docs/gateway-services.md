@@ -33,18 +33,27 @@ flowchart LR
 - Reader and UniFi credentials live below `/data/fcr-gate/secrets/` with mode
   `0600`; they are never command-line arguments or repository content.
 - `/healthz` and `/metrics` contain no tag, user, vehicle, or credential values.
-- The service never writes, locks, kills, or otherwise changes RFID tags.
+- The service never writes, locks, kills, or otherwise changes RFID tags, and
+  never installs, overwrites, starts, or stops reader presets.
 
 ## Reader setup
 
-Use the R700 IoT Device Interface, set its regulatory region, enable FastID/TID
-reporting, and select the antenna and RF settings in `gateway.env`. The service
-installs an inventory preset and streams newline-delimited events from
-`/api/v1/data/stream`. Tags without a TID are retained as EPC-only evidence, but
-TID is preferred because it remains stable even when several tags share an EPC.
+The reader's inventory preset is externally owned. The service never installs,
+overwrites, starts, or stops any preset; it requires an inventory preset to be
+running already, then streams newline-delimited events from
+`/api/v1/data/stream`. If the reader is idle or running a non-inventory profile
+at startup, the service refuses to run until the external owner starts the
+preset again. Startup also verifies the active preset read-only: an explicit
+`tidHex` or `fastId` disable on the watched antenna fails startup, because an
+EPC-only preset would silently downgrade learned TID identities; omitted keys
+mean the reader default and only log a warning. Configure the
+regulatory region, FastID/TID reporting, antenna, and RF settings through the
+R700 IoT Device Interface. Tags without a TID are retained as EPC-only
+evidence, but TID is preferred because it remains stable even when several
+tags share an EPC.
 
-The event connection is recycled after 90 seconds without reader data. On clean
-shutdown the service stops its preset.
+The event connection is recycled after 90 seconds without reader data. Shutdown
+leaves the preset running.
 
 ## Multi-visit discovery
 
