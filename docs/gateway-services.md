@@ -43,10 +43,13 @@ overwrites, starts, or stops any preset; it requires an inventory preset to be
 running already, then streams newline-delimited events from
 `/api/v1/data/stream`. If the reader is idle or running a non-inventory profile
 at startup, the service refuses to run until the external owner starts the
-preset again. Configure the regulatory region, FastID/TID reporting, antenna,
-and RF settings through the R700 IoT Device Interface. Tags without a TID are
-retained as EPC-only evidence, but TID is preferred because it remains stable
-even when several tags share an EPC.
+preset again. Startup also verifies, read-only, that the active preset enables
+`tidHex` reporting and `fastId` on the watched antenna port, because an
+EPC-only preset would silently downgrade learned TID identities. Configure the
+regulatory region, FastID/TID reporting, antenna, and RF settings through the
+R700 IoT Device Interface. Tags without a TID are retained as EPC-only
+evidence, but TID is preferred because it remains stable even when several
+tags share an EPC.
 
 The event connection is recycled after 90 seconds without reader data. Shutdown
 leaves the preset running.

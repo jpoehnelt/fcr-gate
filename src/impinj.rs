@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -88,7 +89,7 @@ struct ActivePreset {
     profile: String,
 }
 
-fn active_inventory_preset(status: &ReaderStatus) -> Result<String> {
+fn active_inventory_preset(status: &ReaderStatus) -> Result<Option<String>> {
     if status.interface != "IoT" {
         bail!(
             "reader interface is {}; select the Impinj IoT Device Interface before running the RFID service",
@@ -111,7 +112,7 @@ fn active_inventory_preset(status: &ReaderStatus) -> Result<String> {
                     active.id.as_deref().unwrap_or("transient")
                 );
             }
-            Ok(active.id.as_deref().unwrap_or("transient").to_owned())
+            Ok(active.id.clone())
         }
         Some("idle") => bail!(
             "reader is idle; start the externally managed inventory preset before running the RFID service"
@@ -119,6 +120,38 @@ fn active_inventory_preset(status: &ReaderStatus) -> Result<String> {
         Some(other) => bail!("reader is in unsupported state {other}"),
         None => bail!("reader did not report an IoT inventory state"),
     }
+}
+
+/// Read-only check that the externally owned preset reports the fields learned
+/// ownership depends on: TID (via FastID) on the watched antenna. An EPC-only
+/// preset would silently downgrade tag keys from TID to `EPC:<epc>`.
+fn verify_tid_reporting(preset: &Value, preset_id: &str, antenna_port: u16) -> Result<()> {
+    if preset
+        .pointer("/eventConfig/tagInventory/tidHex")
+        .and_then(Value::as_str)
+        != Some("enabled")
+    {
+        bail!(
+            "preset {preset_id} does not enable eventConfig.tagInventory.tidHex; enable TID reporting on the reader before running the RFID service"
+        );
+    }
+    let antenna = preset
+        .pointer("/antennaConfigs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|config| {
+            config.pointer("/antennaPort").and_then(Value::as_u64) == Some(u64::from(antenna_port))
+        })
+        .with_context(|| {
+            format!("preset {preset_id} has no antennaConfig for antenna port {antenna_port}")
+        })?;
+    if antenna.pointer("/fastId").and_then(Value::as_str) != Some("enabled") {
+        bail!(
+            "preset {preset_id} does not enable fastId on antenna port {antenna_port}; TID reporting requires FastID"
+        );
+    }
+    Ok(())
 }
 
 impl ImpinjClient {
@@ -146,9 +179,10 @@ impl ImpinjClient {
         self.health.clone()
     }
 
-    /// Verifies that an externally managed inventory preset is already running.
-    /// The service never installs, overwrites, starts, or stops reader presets.
-    pub async fn require_inventory_preset(&self) -> Result<()> {
+    /// Verifies that an externally managed inventory preset is already running
+    /// and reports the fields discovery depends on. The service never installs,
+    /// overwrites, starts, or stops reader presets.
+    pub async fn require_inventory_preset(&self, config: &Config) -> Result<()> {
         let status: ReaderStatus = self
             .authorized(self.http.get(self.url("/status")).timeout(REQUEST_TIMEOUT))
             .send()
@@ -159,8 +193,29 @@ impl ImpinjClient {
             .json()
             .await
             .context("invalid reader status response")?;
-        let preset = active_inventory_preset(&status)?;
-        info!(event = "reader_preset_reused", preset = %preset, "streaming the externally managed inventory preset");
+        let Some(preset_id) = active_inventory_preset(&status)? else {
+            warn!(
+                event = "reader_preset_unverified",
+                "the active inventory preset is transient; cannot verify TID reporting"
+            );
+            return Ok(());
+        };
+        let preset: Value = self
+            .authorized(
+                self.http
+                    .get(self.url(&format!("/profiles/inventory/presets/{preset_id}")))
+                    .timeout(REQUEST_TIMEOUT),
+            )
+            .send()
+            .await
+            .context("failed to fetch the active preset")?
+            .error_for_status()
+            .context("active preset request failed")?
+            .json()
+            .await
+            .context("invalid active preset response")?;
+        verify_tid_reporting(&preset, &preset_id, config.antenna_port)?;
+        info!(event = "reader_preset_reused", preset = %preset_id, "streaming the externally managed inventory preset");
         Ok(())
     }
 
@@ -288,7 +343,7 @@ mod tests {
         let preset =
             active_inventory_preset(&status(Some("running"), Some(("Preferred", "inventory"))))
                 .unwrap();
-        assert_eq!(preset, "Preferred");
+        assert_eq!(preset.as_deref(), Some("Preferred"));
     }
 
     #[test]
@@ -306,5 +361,38 @@ mod tests {
                 .to_string()
                 .contains("start the externally managed inventory preset")
         );
+    }
+
+    fn preset(tid_hex: &str, antenna_port: u16, fast_id: &str) -> Value {
+        serde_json::json!({
+            "eventConfig": { "tagInventory": { "epcHex": "enabled", "tidHex": tid_hex } },
+            "antennaConfigs": [{ "antennaPort": antenna_port, "fastId": fast_id }]
+        })
+    }
+
+    #[test]
+    fn preset_with_tid_reporting_on_the_watched_antenna_passes() {
+        verify_tid_reporting(&preset("enabled", 1, "enabled"), "Preferred", 1).unwrap();
+    }
+
+    #[test]
+    fn epc_only_preset_is_refused_before_streaming() {
+        let error =
+            verify_tid_reporting(&preset("disabled", 1, "enabled"), "Preferred", 1).unwrap_err();
+        assert!(error.to_string().contains("tidHex"));
+
+        let missing = serde_json::json!({ "antennaConfigs": [] });
+        assert!(verify_tid_reporting(&missing, "Preferred", 1).is_err());
+    }
+
+    #[test]
+    fn preset_without_fastid_or_watched_antenna_is_refused() {
+        let error =
+            verify_tid_reporting(&preset("enabled", 1, "disabled"), "Preferred", 1).unwrap_err();
+        assert!(error.to_string().contains("fastId"));
+
+        let error =
+            verify_tid_reporting(&preset("enabled", 2, "enabled"), "Preferred", 1).unwrap_err();
+        assert!(error.to_string().contains("no antennaConfig"));
     }
 }

@@ -112,7 +112,7 @@ async fn run(loki_metrics: std::sync::Arc<logging::LokiMetrics>) -> Result<()> {
     let mut store = Store::open(&config.state_db, config.actor.clone())?;
 
     let reader = ImpinjClient::new(&config)?;
-    reader.require_inventory_preset().await?;
+    reader.require_inventory_preset(&config).await?;
     let reader_health = reader.health();
     let unifi = (config.gate_mode.enabled() || config.discovery_mode.enabled())
         .then(|| UnifiClient::new(&config))
