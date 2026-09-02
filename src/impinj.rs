@@ -125,31 +125,55 @@ fn active_inventory_preset(status: &ReaderStatus) -> Result<Option<String>> {
 /// Read-only check that the externally owned preset reports the fields learned
 /// ownership depends on: TID (via FastID) on the watched antenna. An EPC-only
 /// preset would silently downgrade tag keys from TID to `EPC:<epc>`.
+///
+/// The R700 omits defaulted keys from preset bodies, so an absent key means
+/// "reader default", not "disabled": warn and continue. Only an explicit
+/// non-enabled value fails startup.
 fn verify_tid_reporting(preset: &Value, preset_id: &str, antenna_port: u16) -> Result<()> {
-    if preset
+    match preset
         .pointer("/eventConfig/tagInventory/tidHex")
         .and_then(Value::as_str)
-        != Some("enabled")
     {
-        bail!(
-            "preset {preset_id} does not enable eventConfig.tagInventory.tidHex; enable TID reporting on the reader before running the RFID service"
-        );
+        Some("enabled") => {}
+        Some(other) => bail!(
+            "preset {preset_id} sets eventConfig.tagInventory.tidHex to {other}; enable TID reporting on the reader before running the RFID service"
+        ),
+        None => warn!(
+            event = "reader_preset_tid_unverified",
+            preset = preset_id,
+            "preset omits eventConfig.tagInventory.tidHex; relying on the reader default"
+        ),
     }
-    let antenna = preset
-        .pointer("/antennaConfigs")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|config| {
-            config.pointer("/antennaPort").and_then(Value::as_u64) == Some(u64::from(antenna_port))
-        })
-        .with_context(|| {
-            format!("preset {preset_id} has no antennaConfig for antenna port {antenna_port}")
-        })?;
-    if antenna.pointer("/fastId").and_then(Value::as_str) != Some("enabled") {
-        bail!(
-            "preset {preset_id} does not enable fastId on antenna port {antenna_port}; TID reporting requires FastID"
-        );
+    let antenna = match preset.pointer("/antennaConfigs").and_then(Value::as_array) {
+        None => {
+            warn!(
+                event = "reader_preset_antenna_unverified",
+                preset = preset_id,
+                "preset omits antennaConfigs; relying on the reader default"
+            );
+            return Ok(());
+        }
+        Some(configs) => configs
+            .iter()
+            .find(|config| {
+                config.pointer("/antennaPort").and_then(Value::as_u64)
+                    == Some(u64::from(antenna_port))
+            })
+            .with_context(|| {
+                format!("preset {preset_id} has no antennaConfig for antenna port {antenna_port}")
+            })?,
+    };
+    match antenna.pointer("/fastId").and_then(Value::as_str) {
+        Some("enabled") => {}
+        Some(other) => bail!(
+            "preset {preset_id} sets fastId to {other} on antenna port {antenna_port}; TID reporting requires FastID"
+        ),
+        None => warn!(
+            event = "reader_preset_fastid_unverified",
+            preset = preset_id,
+            antenna = antenna_port,
+            "preset omits fastId on the watched antenna; relying on the reader default"
+        ),
     }
     Ok(())
 }
@@ -376,13 +400,28 @@ mod tests {
     }
 
     #[test]
-    fn epc_only_preset_is_refused_before_streaming() {
+    fn preset_relying_on_reader_defaults_warns_but_streams() {
+        // Literal body of the live R700 `default` preset: the reader omits
+        // defaulted keys (no eventConfig, no fastId), so absence must not bail.
+        let default_preset = serde_json::json!({
+            "antennaConfigs": [{
+                "antennaPort": 1,
+                "transmitPowerCdbm": 3300,
+                "inventorySession": 2,
+                "inventorySearchMode": "dual-target",
+                "estimatedTagPopulation": 32,
+                "rfMode": 1110
+            }]
+        });
+        verify_tid_reporting(&default_preset, "default", 1).unwrap();
+        verify_tid_reporting(&serde_json::json!({}), "bare", 1).unwrap();
+    }
+
+    #[test]
+    fn explicitly_epc_only_preset_is_refused_before_streaming() {
         let error =
             verify_tid_reporting(&preset("disabled", 1, "enabled"), "Preferred", 1).unwrap_err();
         assert!(error.to_string().contains("tidHex"));
-
-        let missing = serde_json::json!({ "antennaConfigs": [] });
-        assert!(verify_tid_reporting(&missing, "Preferred", 1).is_err());
     }
 
     #[test]
