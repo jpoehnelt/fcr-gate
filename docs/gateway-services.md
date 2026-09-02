@@ -44,7 +44,14 @@ installs an inventory preset and streams newline-delimited events from
 TID is preferred because it remains stable even when several tags share an EPC.
 
 The event connection is recycled after 90 seconds without reader data. On clean
-shutdown the service stops its preset.
+shutdown the service stops its preset, unless `IMPINJ_PRESET_REUSE_ONLY=true`.
+
+Set `IMPINJ_PRESET_REUSE_ONLY=true` together with `IMPINJ_PROFILE_ID` naming an
+externally owned preset (for example `Preferred`) to ride along on an existing
+inventory pipeline. In this mode the service only reuses the already-running
+preset and streams `/api/v1/data/stream`; it never installs, overwrites, starts,
+or stops any preset. If the reader is idle at startup the service refuses to run
+until the external owner starts the preset again.
 
 ## Multi-visit discovery
 

@@ -153,7 +153,9 @@ async fn run(loki_metrics: std::sync::Arc<logging::LokiMetrics>) -> Result<()> {
                 result?;
                 info!(event = "service_shutdown_requested", "shutdown requested");
                 stream_task.abort();
-                if let Err(error) = reader.stop_profile(&config.profile_id).await {
+                if config.preset_reuse_only {
+                    info!(event = "reader_profile_left_running", profile = %config.profile_id, "leaving the externally owned reader preset running");
+                } else if let Err(error) = reader.stop_profile(&config.profile_id).await {
                     warn!(event = "reader_profile_stop_failed", %error, "could not stop the owned reader profile during shutdown");
                 }
                 if let Some(web_handle) = web_handle {
@@ -1128,6 +1130,7 @@ mod tests {
             verify_tls: false,
             ca_certificate: None,
             profile_id: "test".into(),
+            preset_reuse_only: false,
             antenna_port: 1,
             transmit_power_cdbm: 3000,
             rf_mode: 4,

@@ -60,6 +60,7 @@ pub struct Config {
     pub verify_tls: bool,
     pub ca_certificate: Option<PathBuf>,
     pub profile_id: String,
+    pub preset_reuse_only: bool,
     pub antenna_port: u16,
     pub transmit_power_cdbm: i32,
     pub rf_mode: u16,
@@ -104,6 +105,7 @@ impl Config {
         let profile_id = validate_profile_id(
             &env::var("IMPINJ_PROFILE_ID").unwrap_or_else(|_| "fcr-gate-reader".into()),
         )?;
+        let preset_reuse_only = boolean("IMPINJ_PRESET_REUSE_ONLY", false)?;
         let health_enabled = boolean("FCR_GATE_HEALTH_ENABLED", true)?;
         let gate_mode =
             parse_gate_mode(&env::var("RFID_GATE_MODE").unwrap_or_else(|_| "disabled".into()))?;
@@ -168,6 +170,7 @@ impl Config {
             verify_tls,
             ca_certificate,
             profile_id,
+            preset_reuse_only,
             antenna_port: number("IMPINJ_ANTENNA_PORT", 1)?,
             transmit_power_cdbm: number("IMPINJ_TX_POWER_CDBM", 3000)?,
             rf_mode: number("IMPINJ_RF_MODE", 4)?,

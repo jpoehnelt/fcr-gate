@@ -89,6 +89,54 @@ struct ActivePreset {
     profile: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileAction {
+    Reuse,
+    Install,
+}
+
+fn plan_profile_action(
+    status: &ReaderStatus,
+    profile_id: &str,
+    reuse_only: bool,
+) -> Result<ProfileAction> {
+    if status.interface != "IoT" {
+        bail!(
+            "reader interface is {}; select the Impinj IoT Device Interface before running the RFID service",
+            status.interface
+        );
+    }
+    if status.status.as_deref() == Some("no region") {
+        bail!("reader has no regulatory region configured");
+    }
+    match status.status.as_deref() {
+        Some("running" | "armed") => {
+            let active = status
+                .active_preset
+                .as_ref()
+                .context("reader is active but did not report an active preset")?;
+            if active.profile == "inventory" && active.id.as_deref() == Some(profile_id) {
+                return Ok(ProfileAction::Reuse);
+            }
+            bail!(
+                "reader is already running profile {} ({}) and will not be taken over",
+                active.profile,
+                active.id.as_deref().unwrap_or("transient")
+            );
+        }
+        Some("idle") => {
+            if reuse_only {
+                bail!(
+                    "reader is idle and IMPINJ_PRESET_REUSE_ONLY=true; refusing to install or start preset {profile_id}"
+                );
+            }
+            Ok(ProfileAction::Install)
+        }
+        Some(other) => bail!("reader is in unsupported state {other}"),
+        None => bail!("reader did not report an IoT inventory state"),
+    }
+}
+
 impl ImpinjClient {
     pub fn new(config: &Config) -> Result<Self> {
         let mut builder = Client::builder()
@@ -125,35 +173,12 @@ impl ImpinjClient {
             .json()
             .await
             .context("invalid reader status response")?;
-        if status.interface != "IoT" {
-            bail!(
-                "reader interface is {}; select the Impinj IoT Device Interface before running the RFID service",
-                status.interface
-            );
-        }
-        if status.status.as_deref() == Some("no region") {
-            bail!("reader has no regulatory region configured");
-        }
-        match status.status.as_deref() {
-            Some("running" | "armed") => {
-                let active = status
-                    .active_preset
-                    .context("reader is active but did not report an active preset")?;
-                if active.profile == "inventory"
-                    && active.id.as_deref() == Some(config.profile_id.as_str())
-                {
-                    info!(event = "reader_profile_reused", profile = %config.profile_id, "reusing active reader profile");
-                    return Ok(());
-                }
-                bail!(
-                    "reader is already running profile {} ({}) and will not be taken over",
-                    active.profile,
-                    active.id.as_deref().unwrap_or("transient")
-                );
+        match plan_profile_action(&status, &config.profile_id, config.preset_reuse_only)? {
+            ProfileAction::Reuse => {
+                info!(event = "reader_profile_reused", profile = %config.profile_id, "reusing active reader profile");
+                return Ok(());
             }
-            Some("idle") => {}
-            Some(other) => bail!("reader is in unsupported state {other}"),
-            None => bail!("reader did not report an IoT inventory state"),
+            ProfileAction::Install => {}
         }
 
         let profile = build_inventory_request(config);
@@ -363,5 +388,50 @@ mod tests {
         let reconnecting = health.snapshot();
         assert!(!reconnecting.connected);
         assert_eq!(reconnecting.last_activity_ms, connected.last_activity_ms);
+    }
+
+    fn status(state: Option<&str>, preset: Option<(&str, &str)>) -> ReaderStatus {
+        ReaderStatus {
+            interface: "IoT".into(),
+            status: state.map(Into::into),
+            active_preset: preset.map(|(id, profile)| ActivePreset {
+                id: Some(id.into()),
+                profile: profile.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn running_matching_preset_is_reused_without_writes() {
+        for reuse_only in [false, true] {
+            let action = plan_profile_action(
+                &status(Some("running"), Some(("Preferred", "inventory"))),
+                "Preferred",
+                reuse_only,
+            )
+            .unwrap();
+            assert_eq!(action, ProfileAction::Reuse);
+        }
+    }
+
+    #[test]
+    fn running_foreign_preset_is_never_taken_over() {
+        let error = plan_profile_action(
+            &status(Some("running"), Some(("Preferred", "inventory"))),
+            "fcr-gate-reader",
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("will not be taken over"));
+    }
+
+    #[test]
+    fn idle_reader_installs_only_when_preset_is_managed() {
+        let action = plan_profile_action(&status(Some("idle"), None), "fcr-gate-reader", false);
+        assert_eq!(action.unwrap(), ProfileAction::Install);
+
+        let error =
+            plan_profile_action(&status(Some("idle"), None), "Preferred", true).unwrap_err();
+        assert!(error.to_string().contains("refusing to install"));
     }
 }
